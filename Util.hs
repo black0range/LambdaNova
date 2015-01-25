@@ -1,4 +1,11 @@
+{-----------------------------------------------------------------------------------------
+Module name: Status Codes
+Made by:     Tomas Möre 2015
+
+Utility library. 
+------------------------------------------------------------------------------------------}
 {-# LANGUAGE OverloadedStrings #-}
+
 module Util where
 
 import System.IO

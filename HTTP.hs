@@ -1,14 +1,22 @@
+{-----------------------------------------------------------------------------------------
+Module name: HTTP
+Made by:     Tomas Möre 2015
+
+
+------------------------------------------------------------------------------------------}
+
 {-# LANGUAGE OverloadedStrings #-}
 module HTTP where
 
 import Cookie
 import Util
+import qualified Headers as H
 
 import qualified Data.CaseInsensitive as CI
 import qualified Data.ByteString      as B
 import qualified Data.ByteString.Char8 as B (words) 
 import qualified Data.ByteString.Internal  as BI
-import Network.HTTP.Types
+--import Network.HTTP.Types
 
 
 import System.IO.Unsafe
@@ -27,9 +35,8 @@ type PathString       = ByteString
 type PathFragment     = ByteString
 type PathFragments    = [PathFragment]
 
-type Headers          = [Header]
-
-type StatusCode = Int
+type ContentLength = Integer
+type StatusCode    = Int
 
 type ResponseHeaders = [(ByteString, ByteString)]
 
@@ -49,13 +56,13 @@ instance Show HTTPRequest where
                       in  unwords [ "<HTTPRequest"
                                   ,"Type: "
                                   , show $ requestMethod httpRequest
-                                  , "\nVersion: "
+                                  , "  Version: "
                                   , show $ requestHTTPVersion httpRequest
-                                  ,  "\nPath: "
+                                  ,  "  Path: "
                                   , show $ requestPath httpRequest
-                                  , "\nHeaders: "
+                                  , "  Headers: "
                                   , show $ requestHeaders httpRequest
-                                  , "\nbSocket: "
+                                  , "  bSocket: "
                                   , "<bufferedSocket "
                                   , "socket: "
                                   , show sock
@@ -70,9 +77,35 @@ instance Show HTTPRequest where
                                   , ">>"]
 
 
+{-
+-------------
+FullResponse
+-------------
+A Full Response sends a full Bytestring as a response.
+The server will count the length of the bytestring and send the apporpiate content length.
 
-data Response =   FullResponse   StatusCode ResponseHeaders ByteString
-                | ChukedResponse StatusCode ResponseHeaders [ByteString]
+If keep alive is set in server options and |Connection: Close| is not part of the header fields.
+The server will keep listening on the connection
+
+-----------------
+FullLazyResponse
+-----------------
+Same as as full response but takes a lazy list.
+This requires the |ContentLength| field to be set.
+This enables space effitient sending of data
+
+If |ContentLength| is set to |Nothing| the server will calculate the length of the entire list before sending.
+
+-----------------
+ChukedResponse
+-----------------
+Chunked response accepts a list of Bytestrings 
+
+-}
+
+data Response =   FullResponse    	StatusCode ResponseHeaders ByteString
+				| FullLazyResponse 	StatusCode ResponseHeaders [ByteString] (Maybe ContentLength)
+                | ChukedResponse 	StatusCode ResponseHeaders [ByteString]
                 | ManualResponse 
 
 data HTTPParsingResult =  ParsingSuccess HTTPRequest 
@@ -107,7 +140,7 @@ parseVersion _          = Nothing
 
 -- constant for emty Header
 emptyHeader :: Header
-emptyHeader = (CI.mk B.empty, B.empty)
+emptyHeader = (H.stringToHeaderName B.empty, B.empty)
 
 
 isEmptyHeader :: Header -> Bool
@@ -116,7 +149,7 @@ isEmptyHeader a = a == emptyHeader
 headerSplitter :: ByteString -> Header
 headerSplitter a =  let (name, valueRaw) = B.breakByte (BI.c2w  ':') a
                         value = stripWhitespace $ B.tail valueRaw
-                    in (CI.mk name, value) 
+                    in (H.stringToHeaderName name, value) 
 
 parseHeaders :: [ByteString] -> RequestHeaders
 parseHeaders inData  = [splitted | raw <- inData, let splitted = headerSplitter raw,  not $ isEmptyHeader splitted ] 

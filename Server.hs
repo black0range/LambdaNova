@@ -50,7 +50,7 @@ import Data.Monoid
 
 import Util
 import HTTP
-import statusCodeToStrs
+import StatusCodes
 
 
 type WebThunk = (HTTPRequest -> IO Response)
@@ -74,17 +74,49 @@ invalidReuqestResponse = B.append "HTTP/1.1 400 Bad Request" crlf
 -- This function handles the response to the request. Return a Boolean. If True 
 
 responseHandler :: (ByteString -> IO Int) -> HTTPParsingResult -> WebThunk -> IO KeepGoing
-responseHandler s (ParsingSuccess request) thunk = 
+responseHandler send (ParsingSuccess request) thunk = 
   do 
     response <- thunk request
     let (status, responseHeaders) = case  response of 
                                 FullResponse   a b  _ -> (a, b)
                                 ChukedResponse a b  _ -> (a, b)
+          statusLine = B.concat [mainHTTPVersion, " ", statusCodeToStr status, crlf]
+
+         headerSender :: [ByteString] -> IO ()
+         headerSender a = case a of 
+         					[] -> send crlf >> return () 
+         					_  -> let chunk = take 10
+         							  rest  = drop 10
+         							  readString = B.concat chunk
+         						  in (send readString) >> headerSender rest
+
     case response of 
-      Manual -> return True
-      FullResponse   _ _ fullString    -> do
-                                            let headers = content:responseHeaders  
-      ChukedResponse _ _ chunkedString ->
+    	-- If response is set to Manual we expect the user to have taken care of everything
+    	ManualResponse -> return True
+    	-- FullResposne asks the server to count the content and send it all. 
+    	-- Full response takes a full bytestring however we still send the data in smaller sizes of max 4kB each (4 KB will be set to a setting)
+      	FullResponse   _ _ fullString    -> do
+                                            let contentLength = (H.ContentLength, B.length fullString)
+                                            	headers       = (contentLength:responseHeaders) 
+                                            	headerList    = map H.toSendRow headers
+
+                                            	bodySender :: ByteString -> IO ()
+                                            	bodySender a = let 	chunkSize = 1024 * 4) 
+                                            						chunk = B.take chunkSize a
+                                            						rest  = B.drop chunkSize a
+                                            					in send chunk >> bodySender rest
+                                            send 		 statusLine
+                                            headerSender headerList
+                                            bodySender   fullString
+                                            send crlf
+                                            let keepAlive = lookup responseHeaders H.Close
+                                            case keepAlive of
+                                            	Nothing 	 -> return False 
+                                            	Just "Close" -> return True
+        -- Full LazyResponbse is the same ass FullResponse Except that we expect a list of ByteStrings
+        -- A Full Lazy Response requires a content Length parameter as well
+        FullLazyResponse _ _ chunkedString contentLength ->
+      	ChukedResponse _ _ chunkedString ->
       FullResponse FullResponse   Status ResponseHeaders ByteString
                 | ChukedResponse Status ResponseHeaders [ByteString]
 responseHandler s error _ =
