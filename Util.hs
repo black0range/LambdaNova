@@ -67,3 +67,5 @@ bufferedSocketRead (socket, buffer, bufferSize,_,_) =
         return (read, string) 
     where 
         socketReader ptr = recvBufFrom socket ptr bufferSize
+
+

@@ -13,9 +13,15 @@ ex: import Headers qualified H
 module Headers where
 import util
 import qualified Data.Bytestring as B
+import Data.Time.HTTP
+import Data.Time.Clock
 
 type Header           = (HeaderName, Bytestring)
 type Headers          = [Header]
+
+
+dateHeader :: IO Header
+dateHeader = (Date, toAscii . getCurrentTime)
 
 data HeaderName =     AIM                       
                   |   Accept                    

@@ -1,3 +1,8 @@
-import HTTPServer
+import Server
 
-main = serve (\x -> putStrLn "Hello world!")
+
+tests :: Bool
+tests = [ , ]
+
+
+main = 

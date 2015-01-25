@@ -11,8 +11,7 @@ module HTTP where
 import Cookie
 import Util
 import qualified Headers as H
-
-import qualified Data.CaseInsensitive as CI
+import qualified URI as URI
 import qualified Data.ByteString      as B
 import qualified Data.ByteString.Char8 as B (words) 
 import qualified Data.ByteString.Internal  as BI
@@ -38,12 +37,21 @@ type PathFragments    = [PathFragment]
 type ContentLength = Integer
 type StatusCode    = Int
 
+type Host = Bytestring
+
 type ResponseHeaders = [(ByteString, ByteString)]
+
+type HTTPParseingConditions = [(Bool, HTTPParsingResult)]
+
+data HTTPVersion = HTTP09 | HTTP10 | HTTP11
+
+data HTTPMethod = OPTIONS | GET | HEAD | POST | PUT | DELETE | TRACE | CONNECT
 
 data HTTPRequest      = HTTPRequest {    requestMethod       :: StdMethod
                                        , requestPath         :: PathFragments
                                        , resutQuery          :: Query
-                                       , requestHTTPVersion  :: HttpVersion
+                                       , requestHost         :: Host 
+                                       , requestHTTPVersion  :: HTTPVerson
                                        , requestHeaders      :: RequestHeaders
                                        , requestCookies      :: Cookies
                                        , bufSocket           :: BufferedSocket
@@ -103,9 +111,9 @@ Chunked response accepts a list of Bytestrings
 
 -}
 
-data Response =   FullResponse    	StatusCode ResponseHeaders ByteString
-				| FullLazyResponse 	StatusCode ResponseHeaders [ByteString] (Maybe ContentLength)
-                | ChukedResponse 	StatusCode ResponseHeaders [ByteString]
+data Response =   FullResponse      StatusCode ResponseHeaders ByteString
+                | FullLazyResponse  StatusCode ResponseHeaders [ByteString] (Maybe ContentLength)
+                | ChukedResponse    StatusCode ResponseHeaders [ByteString]
                 | ManualResponse 
 
 data HTTPParsingResult =  ParsingSuccess HTTPRequest 
@@ -115,7 +123,8 @@ data HTTPParsingResult =  ParsingSuccess HTTPRequest
                         | HeaderLimitReached 
                         | InvalidRequestLine 
                         | LengthRequired
-                        | MissingHeaders 
+                        | MissingHeaders
+                        | MissingHost 
                         | UriTooLarge
     deriving (Show)
 
@@ -127,16 +136,22 @@ data HeaderResult =   HeaderSuccess [ByteString]
 
 
 
+
 splitPath :: PathString -> PathFragments
 splitPath pathStr = filter (/=B.empty) (B.split (BI.c2w '/') pathStr)
 
 
 
 parseVersion :: ByteString -> Maybe HttpVersion
-parseVersion "HTTP/0.9" = Just http09
-parseVersion "HTTP/1.0" = Just http10
-parseVersion "HTTP/1.1" = Just http11
+parseVersion "HTTP/0.9" = Just HTTP09
+parseVersion "HTTP/1.0" = Just HTTP10
+parseVersion "HTTP/1.1" = Just HTTP11
 parseVersion _          = Nothing
+
+versionToString  :: HttpVersion -> ByteString
+versionToString HTTP09 = "HTTP/0.9"
+versionToString HTTP10 = "HTTP/1.0"
+versionToString HTTP11 = "HTTP/1.1"
 
 -- constant for emty Header
 emptyHeader :: Header
@@ -233,16 +248,17 @@ readHTTPHeadersReal bSocket maxLineLength maxNrHeaders iteration headers=
 readHTTPHeaders :: BufferedSocket -> MaxLineLength -> Int -> IO HeaderResult
 readHTTPHeaders bSocket maxLineLength maxNrHeaders = readHTTPHeadersReal bSocket  maxLineLength maxNrHeaders 0 (return [])
 
-
-
+send100Continue:: BufferedSocket   -> HTTPVersion -> Maybe IO ()
+send100Continue (socket,_,_,_,_,_) HTTP11 = 
+send100Continue _  _ = Nothing
 
 -- Reads the full http request from a bufferd socket
 -- Be a bit cautious as it is possible that this can fail and throw an exception
 readHTTPRequst :: BufferedSocket -> MaxLineLength -> IO HTTPParsingResult
 readHTTPRequst bSocket maxLength =
   do 
-    maybeFirstLine            <- getLineHTTP maxLength bSocket
-    headerStrListAttempt <- readHTTPHeaders bSocket maxLength 100
+    maybeFirstLine          <- getLineHTTP maxLength bSocket
+    headerStrListAttempt    <- readHTTPHeaders bSocket maxLength 100
 
     -- Warding a few of these statments are unsafe and might throw an exception if not handeled carefully.
     -- 
@@ -264,24 +280,35 @@ readHTTPRequst bSocket maxLength =
           cookieList                                 = case lookup "Cookie" headerList of
                                                             Nothing           -> []
                                                             Just cookieString -> parseCookies cookieString
+          host                                       = lookup H.Host headerList
+
+          urlAttempt                                 = URI.parse strPathFull
+
+
           (pathStr, query'nFrag)                     = B.breakByte (BI.c2w '?') strPathFull
           (queryStr, fragment)                       = B.breakByte (BI.c2w '#') query'nFrag
 
-          pathSplit                                  = splitPath pathStr
-          query                                      = parseQuery queryStr
+          pathSplit                                  = splitPath $ case urlAttempt of 
+                                                                        Nothing -> pathStr
+                                                                        _       -> URL.getPath
+          query                                      = parseQuery $ case urlAttempt of 
+                                                                        Nothing -> queryStr
+                                                                        _       -> URL.getQuery 
 
-          -- This is a list of boolean checks to see that the http parsing went ok. 
-          -- This is taking advantage of the lazyness 
-          conditionList::[(Bool, HTTPParsingResult)]
-          conditionList = [   ( isNothing maybeFirstLine                 ,  UriTooLarge)
-                            , ( (length firstLineSplit) < 3              ,  InvalidRequestLine)
-                            , ( headerStrListAttempt == HasMaxLineLength ,  HeaderLineTooLarge)
-                            , ( headerStrListAttempt == TooManyHeaders   ,  HeaderLimitReached)
-                            , ( isNothing versionTest                    ,  InvalidVersion)
-                            , ( isLeft    requestMethodTest              ,  InvalidMethod)
-                            , ( and [ ([] == headerList)
-                                     , (requestMethod == POST)]           , LengthRequired)
-                            -- MissingHeaders
+         -- These requirements will be checked first. If these are a success the server might send a "100 Continue" response once (if the httpversion is 1.1) 
+          essesialRequirements1                      = [  ( isNothing maybeFirstLine    , UriTooLarge)
+                                                        , ( length firstLineSplit) < 3  , InvalidRequestLine)
+                                                        , ( isNothing versionTest       ,  InvalidVersion)
+                                                        , ( isLeft    requestMethodTest ,  InvalidMethod)
+
+           essesialRequirements2                     =  [ ( headerStrListAttempt == HasMaxLineLength ,  HeaderLineTooLarge)
+                                                        , ( headerStrListAttempt == TooManyHeaders   ,  HeaderLimitReached)]
+
+          http11Requirements                         = [ ( isNothign host , MissingHost)]
+
+          conditionList::HTTPParseingConditions
+          conditionList = [  ( and [ ([] == headerList)
+                                     , (requestMethod == POST)]          , LengthRequired)
                             , (  otherwise ,  ParsingSuccess (HTTPRequest {   requestMethod       = requestMethod
                                                                             , requestPath         = pathSplit
                                                                             , resutQuery          = query
@@ -291,9 +318,15 @@ readHTTPRequst bSocket maxLength =
                                                                             , bufSocket           = bSocket
                                                                            }))
                             ]
-    case lookup True conditionList of
+
+        send100Continue                              = 
+
+
+    case lookup True essesialRequirements1 of
         Just a  -> return a
-        Nothing -> error "Someone just fucked up badly"  
+        Nothing -> send100Continue
+                            
+
 
 
 
