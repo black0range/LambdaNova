@@ -1,3 +1,2 @@
-import HTTPServer
-
-main = serve (\x -> putStrLn "Hello world!")
+## Schmutt 
+##### A simple webserver
