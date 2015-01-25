@@ -3,8 +3,11 @@ Module name: LambdaNova - a web server
 Made by:     Tomas Möre 2014
 
 
-Usage: Pass a function of type .... to the serve fucntion exported by module
-
+Usage: 	Pass a function of type (HTTPRequest -> IO Response) to the |serve| fucntion exported by module
+	   	yor function is now responsible for putting together the response.
+	   	An empty response will be treated as a |200 OK| without any content 
+	
+		This library uses STRICT strings internally. 
 
 
 
@@ -12,9 +15,9 @@ Notes for editor: Many functions are splitted into two parts, Any function with 
                   has a initating function with the same name but without the postfix
 
 ------------------------------------------------------------------------------------------}
--- packCStringLen :: CStringLen -> IO ByteString
+
 {-# LANGUAGE OverloadedStrings #-}
-module HTTPServer  
+module Server  
 ( serve
 ) where  
 
@@ -28,34 +31,31 @@ import System.IO
 import System.IO.Unsafe
 
 import Network.Socket
-import Network.HTTP.Types 
 
 import qualified Network.Socket.ByteString as B
 import qualified Data.ByteString           as B  hiding (pack)
 import qualified Data.ByteString.Char8     as B  hiding (findSubstring, elemIndex, split, break, spanEnd, dropWhile)
 import qualified Data.ByteString.Internal  as BI
 import qualified Data.ByteString.Builder   as BB
-
+import qualified Data.ByteString.Lazy      as BL
 
 import Data.Word
 
 import Data.IORef
 import Data.Maybe
 import Data.Either
-
+import Data.Monoid
 
 
 
 import Util
 import HTTP
-import Cookie
+import statusCodeToStrs
 
 
+type WebThunk = (HTTPRequest -> IO Response)
 
-type WebThunk = (HTTPRequest -> IO ())
-
-
-
+type KeepGoing = Boolean
 
 
 
@@ -71,63 +71,35 @@ invalidReuqestResponse = B.append "HTTP/1.1 400 Bad Request" crlf
 
 
 
+-- This function handles the response to the request. Return a Boolean. If True 
 
-
-
-
--- Reads the full http request from a bufferd socket
--- Be a bit cautious as it is possible that this can fail and throw an exception
-readHTTPRequst :: BufferedSocket -> MaxLineLength -> IO HTTPParsingResult
-readHTTPRequst bSocket maxLength =
+responseHandler :: (ByteString -> IO Int) -> HTTPParsingResult -> WebThunk -> IO KeepGoing
+responseHandler s (ParsingSuccess request) thunk = 
   do 
-    firstLine            <- getLineHTTP maxLength bSocket
-    headerStrListAttempt <- readHTTPHeaders bSocket maxLength 100
-    let   
-          Just headerStrList                         = headerStrListAttempt
-
-          firstLineSplit                             = B.words firstLine
-          (strRequestType:strPathFull:strVersion:_)  = firstLineSplit
-
-          versionTest                                = parseVersion strVersion
-          Just version                               = versionTest
-
-          requestMethodTest                          = parseMethod strRequestType
-          Right requestMethod                        = requestMethodTest
-
-          headerList                                 = parseHeaders headerStrList
-
-          cookieList                                 = case lookup "Cookie" headerList of
-                                                            Nothing           -> []
-                                                            Just cookieString -> parseCookies cookieString
-                                                            
-          (pathStr, query'nFrag)                     =  case B.elemIndex (BI.c2w '?') strPathFull of 
-                                                            Just index ->  let path  = B.take index strPathFull
-                                                                               query = B.drop index strPathFull
-                                                                            in (path, query)
-                                                            Nothing    ->   (strPathFull, B.empty)
-          (queryStr, fragment)                       = B.breakByte (BI.c2w '#') query'nFrag
-
-          pathSplit                                  = filter (/=B.empty) (B.split (BI.c2w '/') pathStr)
-          query                                      = parseQuery queryStr
-          conditionList::[(Bool, HTTPParsingResult)]
-          conditionList = [   (  (length firstLineSplit) < 3   ,  InvalidRequestLine)
-                            , (  isNothing headerStrListAttempt ,  HeaderLimitReached)
-                            , (  isNothing versionTest          ,  InvalidVersion)
-                            , (  isLeft    requestMethodTest    ,  InvalidMethod)
-                            , (  and [([] == headerList), (requestMethod == POST)] ,  MissingHeaders)
-                            , (  otherwise ,  ParsingSuccess (HTTPRequest {   requestMethod       = requestMethod
-                                                                            , requestPath         = pathSplit
-                                                                            , resutQuery          = query
-                                                                            , requestHTTPVersion  = version
-                                                                            , requestHeaders      = headerList
-                                                                            , requestCookies      = cookieList   
-                                                                            , bufSocket           = bSocket
-                                                                           }))
-                            ]
-    case lookup True conditionList of
-        Just a  -> return a
-        Nothing -> error "Someone just fucked up badly"  
-
+    response <- thunk request
+    let (status, responseHeaders) = case  response of 
+                                FullResponse   a b  _ -> (a, b)
+                                ChukedResponse a b  _ -> (a, b)
+    case response of 
+      Manual -> return True
+      FullResponse   _ _ fullString    -> do
+                                            let headers = content:responseHeaders  
+      ChukedResponse _ _ chunkedString ->
+      FullResponse FullResponse   Status ResponseHeaders ByteString
+                | ChukedResponse Status ResponseHeaders [ByteString]
+responseHandler s error _ =
+  let status = case error of 
+                  UriTooLarge        -> statusCodeToStr 414 --" 414 Request-URI Too Long\n\r"
+                  InvalidVersion     -> statusCodeToStr 505 --" 505 HTTP Version Not Supported\n\r"
+                  InvalidMethod      -> statusCodeToStr 405 --" 405 Method Not Allowed\n\r"        
+                  HeaderLimitReached -> statusCodeToStr 413 --" 413 Request Entity Too Large\n\r"
+                  InvalidRequestLine -> statusCodeToStr 400 --" 400 Bad Request\n\r"
+                  LengthRequired     -> statusCodeToStr 411 --" 411 Length Required\n\r"
+                  _                  -> statusCodeToStr 400 --" 400 Bad Request\n\r"
+      response = B.concat [mainHTTPVersion, " ", status, crlf]
+  in do 
+      s response
+      return False
 
 -- The main thunk of the server. This code is resposible for reading the request handing it over to the "real thunk"
 -- then sending the response in an appropiate manner along with closing down the socket and freeing the pointer
@@ -142,18 +114,15 @@ serverThunk (sock, sockAddr) thunk =
         
         --(headerList, body) <- readToEndOfHeader sock
         --putStrLn  $ show headerList
-        timeStart    <- getCurrentTime
+        --timeStart    <- getCurrentTime
         request      <- readHTTPRequst bSocket bufferSize
-        writtenBytes <- (case request of
-                            ParsingSuccess  request -> send testResponse
-                            _                       -> send invalidReuqestResponse)
+        writtenBytes <- responseHandler send request thunk
+        
+        --putStrLn (show writtenBytes)
+        --timeEnd <-getCurrentTime
+        --putStrLn  (show (diffUTCTime timeEnd timeStart))
 
-        putStrLn (show writtenBytes)
-
-        timeEnd <-getCurrentTime
-        putStrLn  (show (diffUTCTime timeEnd timeStart))
-
-        putStrLn (show request)  
+        --putStrLn (show request)  
         sClose sock
 
 
@@ -165,7 +134,7 @@ serve thunk =
     sock <- socket AF_INET Stream 0
     putStrLn $ show sock
     -- make socket immediately reusable - eases debugging.
-    setSocketOption sock ReuseAddr 0
+    setSocketOption sock ReuseAddr 1
 
     --setSocketOption sock NoDelay 1
     

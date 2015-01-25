@@ -5,19 +5,33 @@ import Cookie
 import Util
 
 import qualified Data.CaseInsensitive as CI
-import qualified Data.CaseInsensitive as CI
-import qualified Data.ByteString           as B
+import qualified Data.ByteString      as B
+import qualified Data.ByteString.Char8 as B (words) 
+import qualified Data.ByteString.Internal  as BI
 import Network.HTTP.Types
 
 
+import System.IO.Unsafe
+
+import Data.Word
+
+import Data.IORef
+import Data.Maybe
+import Data.Either
+
+
 type MaxLineLength    = Int
+
+type PathString       = ByteString
 
 type PathFragment     = ByteString
 type PathFragments    = [PathFragment]
 
 type Headers          = [Header]
 
+type StatusCode = Int
 
+type ResponseHeaders = [(ByteString, ByteString)]
 
 data HTTPRequest      = HTTPRequest {    requestMethod       :: StdMethod
                                        , requestPath         :: PathFragments
@@ -57,12 +71,32 @@ instance Show HTTPRequest where
 
 
 
-data Response =   FullResponse   Status ResponseHeaders ByteString
-                | ChukedResponse Status ResponseHeaders [ByteString]
+data Response =   FullResponse   StatusCode ResponseHeaders ByteString
+                | ChukedResponse StatusCode ResponseHeaders [ByteString]
                 | ManualResponse 
 
-data HTTPParsingResult = ParsingSuccess HTTPRequest | InvalidVersion | InvalidMethod | HeaderLimitReached | InvalidRequestLine | MissingHeaders 
+data HTTPParsingResult =  ParsingSuccess HTTPRequest 
+                        | InvalidVersion 
+                        | InvalidMethod 
+                        | HeaderLineTooLarge
+                        | HeaderLimitReached 
+                        | InvalidRequestLine 
+                        | LengthRequired
+                        | MissingHeaders 
+                        | UriTooLarge
     deriving (Show)
+
+data HeaderResult =   HeaderSuccess [ByteString]  
+                    | HasMaxLineLength 
+                    | TooManyHeaders
+    deriving (Eq)
+
+
+
+
+splitPath :: PathString -> PathFragments
+splitPath pathStr = filter (/=B.empty) (B.split (BI.c2w '/') pathStr)
+
 
 
 parseVersion :: ByteString -> Maybe HttpVersion
@@ -90,14 +124,20 @@ parseHeaders inData  = [splitted | raw <- inData, let splitted = headerSplitter
 
 
 
+-- # Following are two very similary looking functions. The first one allwasy cheacks if the pre read data firs then if that fails it attempts to read more # --
+
 -- This function gets a line from the BufferedSocket.
 -- However this is required to accept lines that are a maximum length of the buffer size
 -- Probably should change this in the future somehow
-getLineHTTPReal :: BufferedSocket -> ByteString -> Int -> MaxLineLength -> IO ByteString
+getLineHTTPReal :: BufferedSocket -> ByteString -> Int -> MaxLineLength -> IO (Maybe ByteString)
 getLineHTTPReal bSocket buffered length maxLength = 
   if length >= maxLength
     then
-        error "HTTP max line length reached"
+      do 
+        writeIORef bufferDataRef    buffered
+        writeIORef bytesInBufferRef length 
+
+        return Nothing 
     else 
         do
             (stringLength, string) <-  bufferedSocketRead bSocket
@@ -107,13 +147,14 @@ getLineHTTPReal bSocket buffered length maxLength =
                         (returnString, rest) -> do   
                                                     writeIORef bufferDataRef    (B.drop crlfLength rest)
                                                     writeIORef bytesInBufferRef (stringLength - ((B.length returnString) + crlfLength)) 
-                                                    return returnString
+                                                    return $ Just returnString
                       
     where 
        (_,_,_, bufferDataRef, bytesInBufferRef) = bSocket
+
 -- Starts the "Real" function.
 -- This is also responsible for rebuffering the buffer if necssesarry
-getLineHTTP ::  MaxLineLength -> BufferedSocket -> IO ByteString  
+getLineHTTP ::  MaxLineLength -> BufferedSocket -> IO (Maybe ByteString)  
 getLineHTTP maxLength bSocket  =
     do  
         bufferData    <- readIORef bufferDatRef
@@ -123,43 +164,59 @@ getLineHTTP maxLength bSocket  =
                                 otherwise -> B.breakSubstring crlf bufferData
         case crlfSplit of
                     (_,"")               -> getLineHTTPReal bSocket bufferData bytesInBuffer maxLength
-                    (returnString, rest) -> do 
-                                             writeIORef bufferDatRef     (B.drop crlfLength rest)
-                                             writeIORef bytesInBufferRef (bytesInBuffer - ((B.length returnString) + crlfLength))
-                                             return returnString
-                    
+                    (returnString, rest) -> if (B.length returnString) >= maxLength 
+                                              then  
+                                                return Nothing
+                                              else
+                                                do 
+                                                 writeIORef bufferDatRef     (B.drop crlfLength rest)
+                                                 writeIORef bytesInBufferRef (bytesInBuffer - ((B.length returnString) + crlfLength))
+                                                 return $ Just returnString
+                        
 
   where 
-    (_,_,_, bufferDatRef, bytesInBufferRef) = bSocket
+    (_,_,_, bufferDatRef, bytesInBufferRef)  = bSocket
+
+
 
 -- This Reads all the HTTP headers from the socket
 -- Same as above procedures this requires a state to run.
-readHTTPHeadersReal :: BufferedSocket -> MaxLineLength ->  Int -> Int -> IO [ByteString] -> IO (Maybe [ByteString])
+readHTTPHeadersReal :: BufferedSocket -> MaxLineLength ->  Int -> Int -> IO [ByteString] -> IO HeaderResult
 readHTTPHeadersReal bSocket maxLineLength maxNrHeaders iteration headers=
     case iteration >= maxNrHeaders of 
-        True -> return Nothing
+        True -> return TooManyHeaders
         False ->   do
-                      line <- getLineHTTP maxLineLength bSocket
-                      if line == ""
-                        then 
-                           fmap Just headers
-                        else 
-                          readHTTPHeadersReal bSocket maxLineLength maxNrHeaders (iteration + 1) (fmap  (line:) headers)
-        
+                      lineResult <- getLineHTTP maxLineLength bSocket
+                      case lineResult of 
+                        Nothing   -> return HasMaxLineLength
+                        Just ""   -> fmap HeaderSuccess headers
+                        Just line -> readHTTPHeadersReal 
+                                        bSocket 
+                                        maxLineLength 
+                                        maxNrHeaders 
+                                        (iteration + 1) 
+                                        (fmap  (line:) headers)
 -- This function is simply the statring function for above
-readHTTPHeaders :: BufferedSocket -> MaxLineLength -> Int -> IO (Maybe [ByteString])
+readHTTPHeaders :: BufferedSocket -> MaxLineLength -> Int -> IO HeaderResult
 readHTTPHeaders bSocket maxLineLength maxNrHeaders = readHTTPHeadersReal bSocket  maxLineLength maxNrHeaders 0 (return [])
+
+
+
 
 -- Reads the full http request from a bufferd socket
 -- Be a bit cautious as it is possible that this can fail and throw an exception
 readHTTPRequst :: BufferedSocket -> MaxLineLength -> IO HTTPParsingResult
 readHTTPRequst bSocket maxLength =
   do 
-    firstLine            <- getLineHTTP maxLength bSocket
+    maybeFirstLine            <- getLineHTTP maxLength bSocket
     headerStrListAttempt <- readHTTPHeaders bSocket maxLength 100
-    let   
-          Just headerStrList                         = headerStrListAttempt
 
+    -- Warding a few of these statments are unsafe and might throw an exception if not handeled carefully.
+    -- 
+    let   
+          HeaderSuccess headerStrList                = headerStrListAttempt     
+
+          Just firstLine                             = maybeFirstLine
           firstLineSplit                             = B.words firstLine
           (strRequestType:strPathFull:strVersion:_)  = firstLineSplit
 
@@ -174,22 +231,24 @@ readHTTPRequst bSocket maxLength =
           cookieList                                 = case lookup "Cookie" headerList of
                                                             Nothing           -> []
                                                             Just cookieString -> parseCookies cookieString
-                                                            
-          (pathStr, query'nFrag)                     =  case B.elemIndex (BI.c2w '?') strPathFull of 
-                                                            Just index ->  let path  = B.take index strPathFull
-                                                                               query = B.drop index strPathFull
-                                                                            in (path, query)
-                                                            Nothing    ->   (strPathFull, B.empty)
+          (pathStr, query'nFrag)                     = B.breakByte (BI.c2w '?') strPathFull
           (queryStr, fragment)                       = B.breakByte (BI.c2w '#') query'nFrag
 
-          pathSplit                                  = filter (/=B.empty) (B.split (BI.c2w '/') pathStr)
+          pathSplit                                  = splitPath pathStr
           query                                      = parseQuery queryStr
+
+          -- This is a list of boolean checks to see that the http parsing went ok. 
+          -- This is taking advantage of the lazyness 
           conditionList::[(Bool, HTTPParsingResult)]
-          conditionList = [   (  (length firstLineSplit) < 3   ,  InvalidRequestLine)
-                            , (  isNothing headerStrListAttempt ,  HeaderLimitReached)
-                            , (  isNothing versionTest          ,  InvalidVersion)
-                            , (  isLeft    requestMethodTest    ,  InvalidMethod)
-                            , (  and [([] == headerList), (requestMethod == POST)] ,  MissingHeaders)
+          conditionList = [   ( isNothing maybeFirstLine                 ,  UriTooLarge)
+                            , ( (length firstLineSplit) < 3              ,  InvalidRequestLine)
+                            , ( headerStrListAttempt == HasMaxLineLength ,  HeaderLineTooLarge)
+                            , ( headerStrListAttempt == TooManyHeaders   ,  HeaderLimitReached)
+                            , ( isNothing versionTest                    ,  InvalidVersion)
+                            , ( isLeft    requestMethodTest              ,  InvalidMethod)
+                            , ( and [ ([] == headerList)
+                                     , (requestMethod == POST)]           , LengthRequired)
+                            -- MissingHeaders
                             , (  otherwise ,  ParsingSuccess (HTTPRequest {   requestMethod       = requestMethod
                                                                             , requestPath         = pathSplit
                                                                             , resutQuery          = query
