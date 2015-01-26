@@ -11,17 +11,18 @@ ex: import Headers qualified H
 
 {-# LANGUAGE OverloadedStrings #-}
 module Headers where
-import util
-import qualified Data.Bytestring as B
-import Data.Time.HTTP
+
+
+import Util
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Internal as BI
 import Data.Time.Clock
 
-type Header           = (HeaderName, Bytestring)
+type Header           = (HeaderName, ByteString)
 type Headers          = [Header]
 
 
-dateHeader :: IO Header
-dateHeader = (Date, toAscii . getCurrentTime)
+
 
 data HeaderName =     AIM                       
                   |   Accept                    
@@ -115,9 +116,19 @@ data HeaderName =     AIM
                   |   Range                     
                   |   Referer                   
                   |   RetryAfter
-                  |   Custom Bytestring
+                  |   TransferEncoding
+                  |   Custom ByteString
+                  deriving (Show, Eq, Read)
+
+dateHeader :: IO Header
+dateHeader =  makeHTTPDate >>= return . (\n -> (Date , n)) 
                
-nameToString :: HeaderName -> Bytestring
+
+chunkedHeader :: Header
+chunkedHeader = (TransferEncoding, "chunked")
+
+
+nameToString :: HeaderName -> ByteString
 nameToString AIM                      = "AIM"                  
 nameToString Accept                   = "Accept"              
 nameToString AcceptAdditions          = "Accept-Additions"      
@@ -127,10 +138,10 @@ nameToString AcceptFeatures           = "Accept-Features"
 nameToString AcceptLanguage           = "Accept-Language"
 nameToString AcceptRanges             = "Accept-Ranges"
 nameToString Age                      = "Age"
-nameToString Allow                    = "Allow
-nameToString Alternates               = "Alternates
-nameToString AuthenticationInfo       = "AuthenticationInfo
-nameToString Authorization            = "Authorization
+nameToString Allow                    = "Allow"
+nameToString Alternates               = "Alternates"
+nameToString AuthenticationInfo       = "AuthenticationInfo"
+nameToString Authorization            = "Authorization"
 nameToString CExt                     = "C-Ext"
 nameToString CMan                     = "C-Man"
 nameToString COpt                     = "C-Opt"
@@ -210,9 +221,10 @@ nameToString Public                   = "Public"
 nameToString Range                    = "Range"          
 nameToString Referer                  = "Referer"           
 nameToString RetryAfter               = "Retry-After"
-nameToString Custom str               = str
+nameToString TransferEncoding         = "Transfer-Encoding"
+nameToString (Custom str)             = str
 
-stringToName :: Bytestring -> HeaderName
+stringToName :: ByteString -> HeaderName
 stringToName "AIM"                        = AIM              
 stringToName "Accept"                     = Accept        
 stringToName "Accept-Additions"           = AcceptAdditions
@@ -291,8 +303,8 @@ stringToName "PICS-Label"                 = PICSLabel
 stringToName "Pep-Info"                   = PepInfo
 stringToName "Position"                   = Position
 stringToName "Pragma"                     = Pragma
-stringToName "Profile-Object"             = Profile
-stringToName "Protocol"                   = Object
+stringToName "Profile-Object"             = ProfileObject
+stringToName "Protocol"                   = Protocol
 stringToName "Protocol-Info"              = ProtocolInfo
 stringToName "Protocol-Query"             = ProtocolQuery
 stringToName "Protocol-Request"           = ProtocolRequest
@@ -305,13 +317,15 @@ stringToName "Public"                     = Public
 stringToName "Range"                      = Range
 stringToName "Referer"                    = Referer
 stringToName "Retry-After"                = RetryAfter
+stringToName "Transfer-Encoding"          = TransferEncoding
 stringToName  str                         = Custom str
 
-toString:: Header -> Bytestring
-toString (a, b) = B.append $ nameToString a b
+toString:: Header -> ByteString
+toString (a, b) = B.concat [(nameToString a), " : ", b]
 
-headersToString:: Headers -> Bytestring
-toString (x:xs) = B.append $ toString x $ headersToString xs
+headersToString:: Headers -> ByteString
+headersToString []     = ""
+headersToString (x:xs) = B.append (toString x) (headersToString xs)
 
-toSendRow:: Header -> Bytestring
-toSendrow a = m.append toString crlf
+toSendRow:: Header -> ByteString
+toSendRow s = B.append (toString s) crlf 

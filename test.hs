@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
 import Server
-
-main = serve (\x -> putStrLn "Hello world!")
+import HTTP 
+import qualified Headers as H
+main = serve (\x -> return $ FullResponse 200 [(H.ContentType, "text/html")] "<html><body><h1>Hello world!</h1><body></body>")

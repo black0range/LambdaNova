@@ -5,8 +5,10 @@ Made by:     Tomas Möre 2015
 
 {-# LANGUAGE OverloadedStrings #-}
 module StatusCodes where
-	
-statusCodeToStrToStr :: IsString str => Int -> str
+
+import Data.ByteString 
+
+statusCodeToStr ::  Int -> ByteString
 statusCodeToStr 100 = "100 Continue"
 statusCodeToStr 101 = "101 Switching Protocols"
 statusCodeToStr 103 = "103 Checkpoint"
@@ -17,14 +19,14 @@ statusCodeToStr 203 = "203 Non-Authoritative Information"
 statusCodeToStr 204 = "204 No Content"
 statusCodeToStr 205 = "205 Reset Content"
 statusCodeToStr 206 = "206 Partial Content"
-statusCodeToStr 307 = "300 Multiple Choices"
+statusCodeToStr 300 = "300 Multiple Choices"
 statusCodeToStr 301 = "301 Moved Permanently"
 statusCodeToStr 302 = "302 Found"
 statusCodeToStr 303 = "303 See Other"
 statusCodeToStr 304 = "304 Not Modified"
 statusCodeToStr 306 = "306 Switch Proxy"
 statusCodeToStr 307 = "307 Temporary Redirect"
-statusCodeToStr 300 = "308 Resume Incomplete"
+statusCodeToStr 308 = "308 Resume Incomplete"
 statusCodeToStr 400 = "400 Bad Request"
 statusCodeToStr 401 = "401 Unauthorized"
 statusCodeToStr 402 = "402 Payment Required"

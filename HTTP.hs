@@ -11,7 +11,8 @@ module HTTP where
 import Cookie
 import Util
 import qualified Headers as H
-import qualified URI as URI
+import qualified URL as URL
+
 import qualified Data.ByteString      as B
 import qualified Data.ByteString.Char8 as B (words) 
 import qualified Data.ByteString.Internal  as BI
@@ -19,12 +20,15 @@ import qualified Data.ByteString.Internal  as BI
 
 
 import System.IO.Unsafe
-
+import Data.Monoid
+import Data.Maybe
 import Data.Word
 
 import Data.IORef
 import Data.Maybe
 import Data.Either
+
+import Control.Monad
 
 
 type MaxLineLength    = Int
@@ -37,21 +41,33 @@ type PathFragments    = [PathFragment]
 type ContentLength = Integer
 type StatusCode    = Int
 
-type Host = Bytestring
+type Query   = [(ByteString, ByteString)]
+type Header  = H.Header
+type Headers = H.Headers
 
-type ResponseHeaders = [(ByteString, ByteString)]
+type RequestHeaders = Headers
+
+type Host = ByteString
+
+type ResponseHeaders = Headers
 
 type HTTPParseingConditions = [(Bool, HTTPParsingResult)]
 
 data HTTPVersion = HTTP09 | HTTP10 | HTTP11
+    deriving (Eq, Ord)
+instance Show HTTPVersion where 
+    show HTTP09 = "HTTP/0.9"
+    show HTTP10 = "HTTP/1.0"
+    show HTTP11 = "HTTP/1.1"
 
-data HTTPMethod = OPTIONS | GET | HEAD | POST | PUT | DELETE | TRACE | CONNECT
+data HTTPMethod = OPTIONS | GET | HEAD | POST | PUT | DELETE | TRACE | CONNECT 
+    deriving(Show, Eq)
 
-data HTTPRequest      = HTTPRequest {    requestMethod       :: StdMethod
+data HTTPRequest      = HTTPRequest {    requestMethod       :: HTTPMethod
                                        , requestPath         :: PathFragments
                                        , resutQuery          :: Query
                                        , requestHost         :: Host 
-                                       , requestHTTPVersion  :: HTTPVerson
+                                       , requestHTTPVersion  :: HTTPVersion
                                        , requestHeaders      :: RequestHeaders
                                        , requestCookies      :: Cookies
                                        , bufSocket           :: BufferedSocket
@@ -89,8 +105,8 @@ instance Show HTTPRequest where
 -------------
 FullResponse
 -------------
-A Full Response sends a full Bytestring as a response.
-The server will count the length of the bytestring and send the apporpiate content length.
+A Full Response sends a full ByteString as a response.
+The server will count the length of the ByteString and send the apporpiate content length.
 
 If keep alive is set in server options and |Connection: Close| is not part of the header fields.
 The server will keep listening on the connection
@@ -102,18 +118,24 @@ Same as as full response but takes a lazy list.
 This requires the |ContentLength| field to be set.
 This enables space effitient sending of data
 
-If |ContentLength| is set to |Nothing| the server will calculate the length of the entire list before sending.
+
+If |ContentLength| is set to |Nothing| the server will calculate the length of the entire list before sending. 
+This method however might be verry performance space unefficient
+
+WARNING! If ContentLength IS set and there are errors in the chunks there server Will NOT be able to send an error message
+
 
 -----------------
 ChukedResponse
 -----------------
-Chunked response accepts a list of Bytestrings 
+Chunked response accepts a list of Strict ByteStrings 
 
+If there 
 -}
 
-data Response =   FullResponse      StatusCode ResponseHeaders ByteString
-                | FullLazyResponse  StatusCode ResponseHeaders [ByteString] (Maybe ContentLength)
-                | ChukedResponse    StatusCode ResponseHeaders [ByteString]
+data Response =   FullResponse      !StatusCode !ResponseHeaders !ByteString
+                | FullLazyResponse  !StatusCode !ResponseHeaders [ByteString] !(Maybe ContentLength)
+                | ChukedResponse    !StatusCode !ResponseHeaders [ByteString]
                 | ManualResponse 
 
 data HTTPParsingResult =  ParsingSuccess HTTPRequest 
@@ -125,7 +147,7 @@ data HTTPParsingResult =  ParsingSuccess HTTPRequest
                         | LengthRequired
                         | MissingHeaders
                         | MissingHost 
-                        | UriTooLarge
+                        | URLTooLarge
     deriving (Show)
 
 data HeaderResult =   HeaderSuccess [ByteString]  
@@ -140,22 +162,35 @@ data HeaderResult =   HeaderSuccess [ByteString]
 splitPath :: PathString -> PathFragments
 splitPath pathStr = filter (/=B.empty) (B.split (BI.c2w '/') pathStr)
 
+parseQuery :: ByteString -> Query
+parseQuery  =  filter (\(a,b) -> a /= "") . map (B.breakByte (BI.c2w '=')) . B.split (BI.c2w '&')
 
 
-parseVersion :: ByteString -> Maybe HttpVersion
+parseVersion :: ByteString -> Maybe HTTPVersion
 parseVersion "HTTP/0.9" = Just HTTP09
 parseVersion "HTTP/1.0" = Just HTTP10
 parseVersion "HTTP/1.1" = Just HTTP11
 parseVersion _          = Nothing
 
-versionToString  :: HttpVersion -> ByteString
+versionToString  :: HTTPVersion -> ByteString
 versionToString HTTP09 = "HTTP/0.9"
 versionToString HTTP10 = "HTTP/1.0"
 versionToString HTTP11 = "HTTP/1.1"
 
+parseMethod :: ByteString -> Maybe HTTPMethod 
+parseMethod "OPTIONS"     = Just OPTIONS
+parseMethod "GET"         = Just GET
+parseMethod "HEAD"        = Just HEAD
+parseMethod "POST"        = Just  POST
+parseMethod "PUT"         = Just PUT
+parseMethod "DELETE"      = Just  DELETE
+parseMethod "TRACE"       = Just TRACE
+parseMethod "CONNECT"     = Just  CONNECT
+parseMethod _ = Nothing
+
 -- constant for emty Header
 emptyHeader :: Header
-emptyHeader = (H.stringToHeaderName B.empty, B.empty)
+emptyHeader = (H.stringToName B.empty, B.empty)
 
 
 isEmptyHeader :: Header -> Bool
@@ -164,7 +199,7 @@ isEmptyHeader a = a == emptyHeader
 headerSplitter :: ByteString -> Header
 headerSplitter a =  let (name, valueRaw) = B.breakByte (BI.c2w  ':') a
                         value = stripWhitespace $ B.tail valueRaw
-                    in (H.stringToHeaderName name, value) 
+                    in (H.stringToName name, value) 
 
 parseHeaders :: [ByteString] -> RequestHeaders
 parseHeaders inData  = [splitted | raw <- inData, let splitted = headerSplitter raw,  not $ isEmptyHeader splitted ] 
@@ -248,14 +283,14 @@ readHTTPHeadersReal bSocket maxLineLength maxNrHeaders iteration headers=
 readHTTPHeaders :: BufferedSocket -> MaxLineLength -> Int -> IO HeaderResult
 readHTTPHeaders bSocket maxLineLength maxNrHeaders = readHTTPHeadersReal bSocket  maxLineLength maxNrHeaders 0 (return [])
 
-send100Continue:: BufferedSocket   -> HTTPVersion -> Maybe IO ()
-send100Continue (socket,_,_,_,_,_) HTTP11 = 
+send100Continue:: (ByteString -> IO Int)   -> HTTPVersion -> Maybe (IO ())
+send100Continue sender HTTP11 = Just $ void $ sender "HTTP/1.1 100 Continue\n\r\n\r" 
 send100Continue _  _ = Nothing
 
 -- Reads the full http request from a bufferd socket
 -- Be a bit cautious as it is possible that this can fail and throw an exception
-readHTTPRequst :: BufferedSocket -> MaxLineLength -> IO HTTPParsingResult
-readHTTPRequst bSocket maxLength =
+readHTTPRequst :: BufferedSocket -> MaxLineLength -> (ByteString -> IO Int) -> IO HTTPParsingResult
+readHTTPRequst bSocket maxLength send =
   do 
     maybeFirstLine          <- getLineHTTP maxLength bSocket
     headerStrListAttempt    <- readHTTPHeaders bSocket maxLength 100
@@ -263,68 +298,74 @@ readHTTPRequst bSocket maxLength =
     -- Warding a few of these statments are unsafe and might throw an exception if not handeled carefully.
     -- 
     let   
-          HeaderSuccess headerStrList                = headerStrListAttempt     
+        HeaderSuccess headerStrList                = headerStrListAttempt     
 
-          Just firstLine                             = maybeFirstLine
-          firstLineSplit                             = B.words firstLine
-          (strRequestType:strPathFull:strVersion:_)  = firstLineSplit
+        Just firstLine                             = maybeFirstLine
+        firstLineSplit                             = B.words firstLine
+        (strRequestType:strPathFull:strVersion:_)  = firstLineSplit
 
-          versionTest                                = parseVersion strVersion
-          Just version                               = versionTest
+        versionTest                                = parseVersion strVersion
+        Just version                               = versionTest
 
-          requestMethodTest                          = parseMethod strRequestType
-          Right requestMethod                        = requestMethodTest
+        requestMethodTest                          = parseMethod strRequestType
+        Just requestMethod                         = requestMethodTest
 
-          headerList                                 = parseHeaders headerStrList
+        headerList                                 = parseHeaders headerStrList
 
-          cookieList                                 = case lookup "Cookie" headerList of
+        cookieList                                 = case lookup H.Cookie headerList of
                                                             Nothing           -> []
                                                             Just cookieString -> parseCookies cookieString
-          host                                       = lookup H.Host headerList
 
-          urlAttempt                                 = URI.parse strPathFull
+        urlAttempt                                 = URL.parse strPathFull
+        Just url                                   = urlAttempt
 
+        maybeURLHost                               = urlAttempt >>= Just . URL.getHost 
 
-          (pathStr, query'nFrag)                     = B.breakByte (BI.c2w '?') strPathFull
-          (queryStr, fragment)                       = B.breakByte (BI.c2w '#') query'nFrag
+        host                                       = case (lookup H.Host headerList) of
+                                                        Nothing -> maybeURLHost
+                                                        a       -> a
 
-          pathSplit                                  = splitPath $ case urlAttempt of 
+        (pathStr, query'nFrag)                     = B.breakByte (BI.c2w '?') strPathFull
+        (queryStr, fragment)                       = B.breakByte (BI.c2w '#') query'nFrag
+
+        pathSplit                                  = splitPath $ case urlAttempt of 
                                                                         Nothing -> pathStr
-                                                                        _       -> URL.getPath
-          query                                      = parseQuery $ case urlAttempt of 
+                                                                        _       -> fromMaybe "" $ URL.getPath url
+        query                                      = parseQuery $ case urlAttempt of 
                                                                         Nothing -> queryStr
-                                                                        _       -> URL.getQuery 
+                                                                        _       -> fromMaybe "" $ URL.getQuery url
 
          -- These requirements will be checked first. If these are a success the server might send a "100 Continue" response once (if the httpversion is 1.1) 
-          essesialRequirements1                      = [  ( isNothing maybeFirstLine    , UriTooLarge)
-                                                        , ( length firstLineSplit) < 3  , InvalidRequestLine)
-                                                        , ( isNothing versionTest       ,  InvalidVersion)
-                                                        , ( isLeft    requestMethodTest ,  InvalidMethod)
+        essesialRequirements1                      = [ ( isNothing maybeFirstLine    , URLTooLarge)
+                                                     , ( (length firstLineSplit) < 3 , InvalidRequestLine)
+                                                     , ( isNothing versionTest       ,  InvalidVersion)
+                                                     , ( isNothing requestMethodTest ,  InvalidMethod)]
+   
 
-           essesialRequirements2                     =  [ ( headerStrListAttempt == HasMaxLineLength ,  HeaderLineTooLarge)
-                                                        , ( headerStrListAttempt == TooManyHeaders   ,  HeaderLimitReached)]
-
-          http11Requirements                         = [ ( isNothign host , MissingHost)]
-
-          conditionList::HTTPParseingConditions
-          conditionList = [  ( and [ ([] == headerList)
-                                     , (requestMethod == POST)]          , LengthRequired)
-                            , (  otherwise ,  ParsingSuccess (HTTPRequest {   requestMethod       = requestMethod
-                                                                            , requestPath         = pathSplit
-                                                                            , resutQuery          = query
-                                                                            , requestHTTPVersion  = version
-                                                                            , requestHeaders      = headerList
-                                                                            , requestCookies      = cookieList   
-                                                                            , bufSocket           = bSocket
-                                                                           }))
-                            ]
-
-        send100Continue                              = 
+        conditionList:: HTTPParseingConditions
+        conditionList = [  ( headerStrListAttempt == HasMaxLineLength                    , HeaderLineTooLarge)
+                        ,  ( headerStrListAttempt == TooManyHeaders                      , HeaderLimitReached)
+                           -- HTTP/1.1 requirement 
+                        ,  ( and [ version == HTTP11, isNothing host]                    , MissingHost) 
+                        ,  ( and [ ([] == headerList), (requestMethod == POST)]          , LengthRequired)
+                        ,  ( otherwise ,  ParsingSuccess $ (HTTPRequest {  requestMethod       = requestMethod
+                                                                         , requestPath         = pathSplit
+                                                                         , resutQuery          = query
+                                                                         , requestHost         = fromMaybe "" host
+                                                                         , requestHTTPVersion  = version
+                                                                         , requestHeaders      = headerList
+                                                                         , requestCookies      = cookieList   
+                                                                         , bufSocket           = bSocket
+                                                                        }))
+                        ]
 
 
     case lookup True essesialRequirements1 of
-        Just a  -> return a
-        Nothing -> send100Continue
+        Just a  ->  return a
+        Nothing ->  (fromMaybe (return ()) $ send100Continue send version) >>
+                    case lookup True conditionList of
+                        Just a -> return a
+                        Nothing -> error "Something fucked up badly"
                             
 
 
