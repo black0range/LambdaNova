@@ -45,7 +45,7 @@ integerToByteString :: Integer -> ByteString
 integerToByteString = builderToStrict . BB.integerDec
 
 intToHex :: Integral a => a -> BB.Builder
-intToHex =  BB.word32Hex . fromIntegral 
+intToHex =  BB.word64Hex . fromIntegral 
 
 -- Constants for the newlineCharacters in CCar format
 crlf :: ByteString

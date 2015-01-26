@@ -125,9 +125,11 @@ responseHandler send (ParsingSuccess request) thunk =
         chunkedSender :: [ByteString] -> IO ()
         chunkedSender []     = void $ send chunkedEnd -- hex zero
         chunkedSender (x:xs) =  let chunkSize = B.length x
-                                in  (send $ builderToStrict $ (intToHex chunkSize) <> builderSemicolon<> crlfBuilder) >>
+                                    hexSize   = builderToStrict $ ((intToHex chunkSize) <> crlfBuilder)
+                                in  (send hexSize) >>
                                         send x >>
-                                            chunkedSender xs 
+                                            send crlf >>
+                                                chunkedSender xs 
     case response of 
         -- If response is set to Manual we expect the user to have taken care of everything
         ManualResponse -> return False

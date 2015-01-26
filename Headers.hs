@@ -321,7 +321,7 @@ stringToName "Transfer-Encoding"          = TransferEncoding
 stringToName  str                         = Custom str
 
 toString:: Header -> ByteString
-toString (a, b) = B.concat [(nameToString a), " : ", b]
+toString (a, b) = B.concat [(nameToString a), ": ", b]
 
 headersToString:: Headers -> ByteString
 headersToString []     = ""
