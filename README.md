@@ -1,5 +1,7 @@
 ### Schmutt 
-##### A simple webserver
+##### A simple webserver with performance in mind
+
+
 ***
 To run a simple hello world program run 
 ```bash
