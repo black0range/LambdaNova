@@ -15,12 +15,12 @@ Notes for editor: Many functions are splitted into two parts, Any function with 
                   has a initating function with the same name but without the postfix
 
 ------------------------------------------------------------------------------------------}
-
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-
 module Server  
-( serve
+( serve,
+    module ServerOptions
 ) where  
 
 
@@ -31,7 +31,8 @@ import Control.Monad
 import qualified Control.Exception as E 
 
 import System.IO
-import System.IO.Unsafe
+import System.IO.Error
+
 
 import Network.Socket
 
@@ -55,6 +56,7 @@ import qualified ErrorResponses as ERROR
 import Util
 import HTTP
 import StatusCodes
+import ServerOptions
 import qualified Headers as H 
 
 type WebThunk = (HTTPRequest -> IO Response)
@@ -76,29 +78,41 @@ invalidReuqestResponse = B.append "HTTP/1.1 400 Bad Request" crlf
 
 
 
--- This function handles the response to the request. Return a Boolean. 
+-- This function handles the response to the request. 
 showExcept a = putStrLn $ "Exception: " ++ show a 
 
-responseHandler :: (ByteString -> IO Int) -> HTTPParsingResult -> WebThunk -> IO KeepGoing
-responseHandler send (ParsingSuccess request) thunk = 
+responseHandler :: (ByteString -> IO Int) -> HTTPParsingResult -> WebThunk -> ServerSettings ->IO KeepGoing
+responseHandler send (ParsingSuccess request) thunk settings = 
   do
-    response <- (thunk request) `E.catches` [ E.Handler (\ (ex :: E.ErrorCall )     -> showExcept ex >> ERROR.internalServerError)
-                                            , E.Handler (\ (ex :: E.IOException)    -> showExcept ex >> ERROR.internalServerError)
-                                            , E.Handler (\ (ex :: E.ArithException) -> showExcept ex >> ERROR.internalServerError)]
+    responseIN <- (thunk request) `E.catches` [ E.Handler (\ (ex :: E.ErrorCall )     -> showExcept ex >> ERROR.internalServerError)
+                                              , E.Handler (\ (ex :: E.IOException)    -> showExcept ex >> ERROR.internalServerError)
+                                              , E.Handler (\ (ex :: E.ArithException) -> showExcept ex >> ERROR.internalServerError)]
     dateHeader <- H.dateHeader                                            
     --response <- E.catch (thunk request)  (\ e -> putStrLn "Error!!!" >>= (\ _ -> ERROR.internalServerError))
     -- Date header for responses 
    
-    let (status, responseHeaders) = case response of 
+    let 
+        -- A security check to make sure that the response wont be sent as chunked if the HTTP version isn't able to handle it
+        -- A warning to the developer should be that if the chunked encoding is sent and the HTTP version isn't correct this might take up a lot of ram
+        response = if (requestHTTPVersion request) < HTTP11 
+                        then
+                            case responseIN of 
+                                ChukedResponse s h b -> FullLazyResponse s h b Nothing
+                                _                    -> responseIN
+                        else
+                            responseIN 
+
+        httpVersionString = versionToString (requestHTTPVersion request)
+
+        (status, responseHeaders) = case response of 
                                         FullResponse      a b  _   -> (a, b)
                                         FullLazyResponse  a b  _ _ -> (a, b)
                                         ChukedResponse    a b  _   -> (a, b)
 
-        statusLine                = B.concat [mainHTTPVersion, " ", statusCodeToStr status, crlf]
+        statusLine                = B.concat [httpVersionString, " ", statusCodeToStr status, crlf]
         keepAlive                 = case lookup H.Connection responseHeaders of 
                                             Nothing      -> return True 
                                             Just _       -> return False
-                                            _            -> return True
                                                     
 
         headerSender :: [ByteString] -> IO ()
@@ -106,14 +120,14 @@ responseHandler send (ParsingSuccess request) thunk =
                             then  
                                 send crlf >> return () 
                             else  
-                                let chunk = take 10 a
-                                    rest  = drop 10 a
+                                let chunk = take 16 a
+                                    rest  = drop 16 a
                                     readString = B.concat chunk
                                 in (send readString) >> headerSender rest
 
         dataSender :: ByteString -> IO ()
         dataSender "" = return ()
-        dataSender a = let  chunkSize = (1024 * 4) 
+        dataSender a = let  chunkSize = (writeBufferSize settings)
                             chunk = B.take chunkSize a
                             rest  = B.drop chunkSize a
                         in send chunk >> dataSender rest
@@ -130,8 +144,10 @@ responseHandler send (ParsingSuccess request) thunk =
                                         send x >>
                                             send crlf >>
                                                 chunkedSender xs 
+
+
     case response of 
-        -- If response is set to Manual we expect the user to have taken care of everything
+        -- If response is set to Manual we expect the developer to have taken care of everything
         ManualResponse -> return False
         -- FullResposne asks the server to count the content and send it all. 
         -- Full response takes a full bytestring however we still send the data in smaller sizes of max 4kB each (4 KB will be set to a setting)
@@ -167,7 +183,7 @@ responseHandler send (ParsingSuccess request) thunk =
                                                         chunkedSender chunkedString >>
                                                             send crlf >>
                                                                 keepAlive
-responseHandler s error _ = 
+responseHandler s error _ _= 
   let status = case error of 
                   URLTooLarge        -> statusCodeToStr 414 --" 414 Request-URI Too Long\n\r"
                   InvalidVersion     -> statusCodeToStr 505 --" 505 HTTP Version Not Supported\n\r"
@@ -183,33 +199,54 @@ responseHandler s error _ =
 
 -- The main thunk of the server. This code is resposible for reading the request handing it over to the "real thunk"
 -- then sending the response in an appropiate manner along with closing down the socket and freeing the pointer
-serverThunk :: (Socket, SockAddr) -> WebThunk -> IO ()
-serverThunk (sock, sockAddr) thunk = 
+serverThunk :: (Socket, SockAddr) -> WebThunk -> ServerSettings -> IO ()
+serverThunk (sock, sockAddr) thunk settings = 
     do 
-        let bufferSize = 1024
+        #ifdef SMUTTDEBUG
+        putStrLn $ "Accepted a new socket on:  " ++ (show sock) ++ " " ++ (show sockAddr)
+        #endif
+        -- Defining a prepared sending procedure. This procedure is sent around to all functions that might need to send data 
+        let 
             send :: ByteString -> IO Int
             send outData = B.sendTo sock outData sockAddr
-        bSocket    <- makeBufferedSocket sock  bufferSize
-        putStrLn $ (show sock) ++ " " ++ (show sockAddr)
-        
-        --(headerList, body) <- readToEndOfHeader sock
-        --putStrLn  $ show headerList
-        --timeStart    <- getCurrentTime
-        request      <- readHTTPRequst bSocket bufferSize send
-        keepAlive <- responseHandler send request thunk
-        putStrLn $ "keep alive?: "++ show keepAlive
-        --putStrLn (show writtenBytes)
-        --timeEnd <-getCurrentTime
-        --putStrLn  (show (diffUTCTime timeEnd timeStart))
 
-        --putStrLn (show request)  
-        sClose sock
+        bSocket    <- makeBufferedSocket sock  (readBufferSize settings)
 
+        case (socketKeepAlive settings) of 
+            True ->  setSocketOption sock KeepAlive 1
+            False -> return ()
+
+        let readLoop = do 
+
+                        #ifdef SMUTTDEBUG
+                        timeStart    <- getCurrentTime
+                        #endif
+
+                        request      <- readHTTPRequst bSocket send settings `E.catch` (\ e -> if isEOFError e then return ClientQuit else E.throw e ) 
+                        keepAlive    <- responseHandler send request thunk settings
+
+                        #ifdef SMUTTDEBUG
+                        timeEnd    <- getCurrentTime
+                        putStrLn show $ diffUTCTime timeStart timeEnd
+                        #endif 
+
+                        if and [ not $ connectionClosed request 
+                              , protocolCanKeepAlive request
+                              , keepAlive]
+                          then 
+                            readLoop
+                          else 
+                            return ()
+         
+        readLoop >> 
+            sClose sock
+    where 
+        bufferSize = readBufferSize settings
 
 -- The server function, Currently give it a function that will process the request and it will run a new thread from every request
-serve :: WebThunk -> IO ()
-serve thunk = 
-   withSocketsDo $ do 
+serveWithSettings :: WebThunk -> ServerSettings-> IO ()
+serveWithSettings thunk serverSettings = withSocketsDo $ do 
+
     -- create socket
     sock <- socket AF_INET Stream 0
     putStrLn $ show sock
@@ -223,9 +260,37 @@ serve thunk =
     bindSocket sock (SockAddrInet 8000 iNADDR_ANY)
 
     -- Tells the socket that it can have max 1000 connections
-    listen sock 1000
+    listen sock $ maxConnections serverSettings
 
-    forever $ do
-                socketData <- accept sock
-                newThread <- forkIO (serverThunk socketData thunk)
-                return ()
+    let 
+        maybeKeepServingRef = keepServing serverSettings
+        Just keepServingRef = maybeKeepServingRef
+
+        threadTakeover = do
+                            socketData <- accept sock
+                            newThread <- forkIO (serverThunk socketData thunk serverSettings)
+                            return ()
+
+        keepGoingFun   = do 
+                           serveAnother <- readIORef keepServingRef
+                           if serveAnother 
+                                then 
+                                    threadTakeover >>
+                                        keepGoingFun
+                                else 
+                                    return ()
+
+        choseServingMethod  = case isNothing maybeKeepServingRef of
+                                    True  -> forever threadTakeover
+                                    False -> keepGoingFun
+
+    -- Makes sure that whatever happends ce close the socket. 
+    choseServingMethod `E.onException` (sClose sock)
+
+serve thunk = serveWithSettings thunk defaultSettings
+
+
+
+
+
+

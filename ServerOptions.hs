@@ -3,33 +3,38 @@ Module name: Server Options
 Made by:     Tomas Möre 2015
  
 ------------------------------------------------------------------------------------------}
-
-
 {-# LANGUAGE OverloadedStrings #-}
+module ServerOptions where 
+import Data.IORef
+{-
 data ServerData       = ServerData {  currentConnections         :: IORef Integer
-									, connectionsFromStart 		 :: IORef Integer
-									, startup              		 :: Date
-									, secondsSinceLastConnection :: Integer
-									}
-data ServerOptions    = ServerOptions {   readBufferSize  :: Integer
-										, readBufferSize  :: Integer 
-										, writeBufferSize :: Integer
-										, maxConnections  :: Integer
-										, keepAlive       :: Boolean
-										, readTimeout     :: Int
-										, writeTimeout    :: Int
-										, extraData       :: Maybe IORef 
+                                    , connectionsFromStart       :: IORef Integer
+                                    , startup                    :: Date
+                                    , secondsSinceLastConnection :: Integer
+                                    }
+                                    -}
+data ServerSettings  = ServerSettings { readBufferSize   :: Int                                       
+                                        , writeBufferSize  :: Int
+                                        , maxConnections   :: Int
 
-										}
+                                        , socketKeepAlive  :: Bool
+                                        , readTimeout      :: Int
+                                        , writeTimeout     :: Int
+                                        , keepServing      :: Maybe (IORef Bool)
+                                        , maxPathLegnth    :: Int
+                                        , maxHeaderLength  :: Int
+                                        , maxHeaderCount   :: Int
+                                        }
 
-defaultServerOptions :: ServerOptions
-defaultServerOptions = ServerOptions {    readBufferSize  = (1024 * 4)
-										, readBufferSize  = (1024 * 4)
-										, writeBufferSize = (1024 * 4)
-										, maxConnections  = (1024)
-										, keepAlive       :: Boolean
-										, readTimeout     :: Int
-										, writeTimeout    :: Int
-										, extraData       :: Maybe IORef 
-
-										}
+defaultSettings :: ServerSettings
+defaultSettings       =  ServerSettings  {  readBufferSize  = (8 * 1024)  -- 8 KB
+                                          , writeBufferSize = (8 * 1024)  -- 8 KB
+                                          , maxConnections  = 1024
+                                          , socketKeepAlive = False
+                                          , readTimeout     = 15000000
+                                          , writeTimeout    = 30000000
+                                          , keepServing     = Nothing 
+                                          , maxPathLegnth   = 1024
+                                          , maxHeaderLength = 1024
+                                          , maxHeaderCount  = 128
+                                          }

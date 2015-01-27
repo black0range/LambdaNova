@@ -10,6 +10,8 @@ module HTTP where
 
 import Cookie
 import Util
+import ServerOptions
+
 import qualified Headers as H
 import qualified URL as URL
 
@@ -55,6 +57,7 @@ type HTTPParseingConditions = [(Bool, HTTPParsingResult)]
 
 data HTTPVersion = HTTP09 | HTTP10 | HTTP11
     deriving (Eq, Ord)
+
 instance Show HTTPVersion where 
     show HTTP09 = "HTTP/0.9"
     show HTTP10 = "HTTP/1.0"
@@ -72,6 +75,7 @@ data HTTPRequest      = HTTPRequest {    requestMethod       :: HTTPMethod
                                        , requestCookies      :: Cookies
                                        , bufSocket           :: BufferedSocket
                                        } 
+
 
 instance Show HTTPRequest where
   show httpRequest =  let (sock, buffer, bufSize, bufferDataRef, bufferDataLength) = bufSocket httpRequest
@@ -148,7 +152,11 @@ data HTTPParsingResult =  ParsingSuccess HTTPRequest
                         | MissingHeaders
                         | MissingHost 
                         | URLTooLarge
+                        | ClientQuit
     deriving (Show)
+
+connectionClosed ClientQuit = True
+connectionClosed _          = False
 
 data HeaderResult =   HeaderSuccess [ByteString]  
                     | HasMaxLineLength 
@@ -157,7 +165,9 @@ data HeaderResult =   HeaderSuccess [ByteString]
 
 
 
-
+protocolCanKeepAlive:: HTTPParsingResult -> Bool
+protocolCanKeepAlive (ParsingSuccess a) = (>=HTTP11) $ requestHTTPVersion a 
+protocolCanKeepAlive _                  = False
 
 splitPath :: PathString -> PathFragments
 splitPath pathStr = filter (/=B.empty) (B.split (BI.c2w '/') pathStr)
@@ -289,11 +299,11 @@ send100Continue _  _ = Nothing
 
 -- Reads the full http request from a bufferd socket
 -- Be a bit cautious as it is possible that this can fail and throw an exception
-readHTTPRequst :: BufferedSocket -> MaxLineLength -> (ByteString -> IO Int) -> IO HTTPParsingResult
-readHTTPRequst bSocket maxLength send =
+readHTTPRequst :: BufferedSocket -> (ByteString -> IO Int) -> ServerSettings -> IO HTTPParsingResult
+readHTTPRequst bSocket  send settings =
   do 
-    maybeFirstLine          <- getLineHTTP maxLength bSocket
-    headerStrListAttempt    <- readHTTPHeaders bSocket maxLength 100
+    maybeFirstLine          <- getLineHTTP (maxPathLegnth settings) bSocket
+    headerStrListAttempt    <- readHTTPHeaders bSocket (maxHeaderLength settings) (maxHeaderCount settings)
 
     -- Warding a few of these statments are unsafe and might throw an exception if not handeled carefully.
     -- 
