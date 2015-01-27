@@ -35,6 +35,8 @@ import System.IO.Error
 
 
 import Network.Socket
+import Network.Socket.Options 
+
 
 import qualified Network.Socket.ByteString as B
 import qualified Data.ByteString           as B  hiding (pack)
@@ -212,6 +214,15 @@ serverThunk (sock, sockAddr) thunk settings =
 
         bSocket    <- makeBufferedSocket sock  (readBufferSize settings)
 
+        putStrLn "0"
+        setRecvTimeout sock $ fromIntegral (readTimeout settings)
+        putStrLn "1"
+        setSendTimeout sock $ fromIntegral(writeTimeout settings)
+        putStrLn "2"
+        setSocketOption sock SendBuffer  (writeBufferSize settings) 
+        putStrLn "3"
+        setSocketOption sock RecvBuffer  (readBufferSize settings)
+        putStrLn "4"
         case (socketKeepAlive settings) of 
             True ->  setSocketOption sock KeepAlive 1
             False -> return ()
