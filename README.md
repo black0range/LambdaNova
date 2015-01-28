@@ -1,4 +1,4 @@
-### Schmutt 
+### Smutt 
 ##### A simple webserver with performance in mind
 
 
