@@ -17,7 +17,7 @@ import qualified Data.ByteString.Builder   as BB
 
 import Data.Time.Calendar.WeekDate 
 import Data.Time
-import Data.Time.Calendar.WeekDate
+
 import Data.IORef
 import Foreign
 import Network.Socket
@@ -26,13 +26,13 @@ import Data.Fixed
 
 import Data.Monoid
 
-type ByteString       = B.ByteString
-type BufferSize       = Int
-type BufferDataLength = IORef Int
-type BufferData       = IORef ByteString
 
--- This buffered socket is read by first checking the bufferData ByteString. If that is not enought buffer a bit more data... etc
-type BufferedSocket   = (Socket, (ForeignPtr Word8), BufferSize, BufferData, BufferDataLength)
+import Data.Word
+
+type ByteString       = B.ByteString
+
+
+
 
 builderToStrict :: BB.Builder -> ByteString
 builderToStrict = B.concat . BL.toChunks . BB.toLazyByteString 
@@ -44,9 +44,74 @@ intToByteString = builderToStrict . BB.intDec
 integerToByteString :: Integer -> ByteString
 integerToByteString = builderToStrict . BB.integerDec
 
-intToHex :: Integral a => a -> BB.Builder
-intToHex =  BB.word64Hex . fromIntegral 
 
+intToHexCalc :: Word64 ->  [Word8]
+intToHexCalc 0 = []
+intToHexCalc n =  fromIntegral (n `rem` 16) : intToHexCalc  (n `div` 16)  
+
+
+nToHexChar:: Word8 -> Word8
+nToHexChar x  
+    | x < 10  =  x + nrStart
+    | otherwise =  (x - 10) + charStart
+    where 
+        nrStart   = 48
+        charStart = 65
+
+
+intToHex :: Word64  -> B.ByteString
+intToHex =  B.pack . reverse . map nToHexChar . intToHexCalc
+
+
+
+-- For ansii only
+byteStringToHexReal :: [Word8] -> Maybe Int
+byteStringToHexReal [] = Just 0
+byteStringToHexReal  s
+    | 47 < c && c < 59  = fmap (+nrValue)      next
+    | 96 < c && c < 123 = fmap (+minorCharVal) next
+    | 64 < c && c < 91  = fmap (+majorCharVal) next
+    | otherwise             = Nothing 
+    where 
+        (c:cs)         = s 
+        n              = (length s) - 1
+        exp            = fromIntegral . (* (16 ^ n)) 
+        nrValue        = exp (c - 48) 
+        minorCharVal   = exp (c - 97) 
+        majorCharVal   = exp (c - 65)
+        next           = (byteStringToHexReal cs) 
+
+byteStringToHex :: B.ByteString -> Maybe Int 
+byteStringToHex = byteStringToHexReal . B.unpack
+
+byteStringToIntegerReal :: (Num a) => [Word8] -> Maybe a 
+byteStringToIntegerReal [] = Just 0 
+byteStringToIntegerReal s 
+    | 47 < c && c < 59 = fmap adding next 
+    | otherwise        = Nothing 
+    where 
+        (c:cs) = s
+        n      = (length s) - 1
+        cInt   = fromIntegral c 
+        val    = (cInt  - 48) * (10 ^ n) 
+        adding = (+val)
+        next   = byteStringToIntegerReal cs
+byteStringToInteger :: (Num a) => ByteString -> Maybe a   
+byteStringToInteger s = let unpacked        = B.unpack s
+                            firstCharIsDash = (head unpacked) == dash
+                            f               = if firstCharIsDash
+                                                then 
+                                                    negate 
+                                                else 
+                                                    id 
+                            passOn    = if firstCharIsDash
+                                            then 
+                                                tail unpacked
+                                            else 
+                                                unpacked
+                        in fmap f (byteStringToIntegerReal passOn)
+    where 
+        dash = (BI.c2w '-')
 -- Constants for the newlineCharacters in CCar format
 crlf :: ByteString
 crlf = "\r\n"
@@ -127,31 +192,8 @@ makeHTTPDate =  do
                         returnString = dayName <>  builderWhiteSpace <> monthName <>  builderWhiteSpace <> (BB.intDec dayNumber) <> builderWhiteSpace <>
                                 (BB.intDec hour) <> builderColon <> (BB.intDec min) <> builderColon <> (BB.intDec sec) <> builderWhiteSpace <> (BB.intDec (fromIntegral yearNumber))
                     return $ builderToStrict returnString
-{- 
-This puts together a new "buffered Socket". or bSock
-A buffered socket is a socket which is acommodated by a Ptr. Because of the need to split headers etc up at certain points but still
-safet he rest of the data to be whatever the server requires it to be.
-
-A buffered socket should be called with freeBSocket before disregarded. 
-The server thunk function does so automaticly.
-
--}
-makeBufferedSocket :: Socket -> BufferSize -> IO BufferedSocket
-makeBufferedSocket sock  bufferSize = 
-                    do
-                      bufferDataLength <- newIORef  0 
-                      bufferData       <- newIORef  B.empty
-                      buffer           <- BI.mallocByteString bufferSize
-                      return (sock, buffer, bufferSize, bufferData, bufferDataLength)
 
 
-bufferedSocketRead :: BufferedSocket -> IO (Int, ByteString)
-bufferedSocketRead (socket, buffer, bufferSize,_,_) = 
-    do 
-        (read, _) <- withForeignPtr buffer socketReader
-        let string = BI.fromForeignPtr buffer 0 read
-        return (read, string) 
-    where 
-        socketReader ptr = recvBufFrom socket ptr bufferSize
+
 
 

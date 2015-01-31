@@ -13,7 +13,7 @@ data ServerData       = ServerData {  currentConnections         :: IORef Intege
                                     , secondsSinceLastConnection :: Integer
                                     }
                                     -}
-data ServerSettings  = ServerSettings { readBufferSize   :: Int                                       
+data ServerSettings  = ServerSettings {  readBufferSize   :: Int                                       
                                         , writeBufferSize  :: Int
                                         , maxConnections   :: Int
 

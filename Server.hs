@@ -19,8 +19,8 @@ Notes for editor: Many functions are splitted into two parts, Any function with 
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Server  
-( serve,
-    module ServerOptions
+( serve
+, module ServerOptions
 ) where  
 
 
@@ -56,12 +56,13 @@ import Data.Monoid
 import qualified ErrorResponses as ERROR
 
 import Util
-import HTTP
+import qualified HTTP
 import StatusCodes
 import ServerOptions
+import qualified BufferedSocket as BS 
 import qualified Headers as H 
 
-type WebThunk = (HTTPRequest -> IO Response)
+type WebThunk = (HTTP.Request -> IO HTTP.Response)
 
 type KeepGoing = Bool
 
@@ -83,8 +84,8 @@ invalidReuqestResponse = B.append "HTTP/1.1 400 Bad Request" crlf
 -- This function handles the response to the request. 
 showExcept a = putStrLn $ "Exception: " ++ show a 
 
-responseHandler :: (ByteString -> IO Int) -> HTTPParsingResult -> WebThunk -> ServerSettings ->IO KeepGoing
-responseHandler send (ParsingSuccess request) thunk settings = 
+responseHandler :: (ByteString -> IO Int) -> HTTP.ParsingResult -> WebThunk -> ServerSettings ->IO KeepGoing
+responseHandler send (HTTP.ParsingSuccess request) thunk settings = 
   do
     responseIN <- (thunk request) `E.catches` [ E.Handler (\ (ex :: E.ErrorCall )     -> showExcept ex >> ERROR.internalServerError)
                                               , E.Handler (\ (ex :: E.IOException)    -> showExcept ex >> ERROR.internalServerError)
@@ -96,20 +97,20 @@ responseHandler send (ParsingSuccess request) thunk settings =
     let 
         -- A security check to make sure that the response wont be sent as chunked if the HTTP version isn't able to handle it
         -- A warning to the developer should be that if the chunked encoding is sent and the HTTP version isn't correct this might take up a lot of ram
-        response = if (requestHTTPVersion request) < HTTP11 
+        response = if (HTTP.requestVersion request) < HTTP.HTTP11 
                         then
                             case responseIN of 
-                                ChukedResponse s h b -> FullLazyResponse s h b Nothing
+                                HTTP.ChukedResponse s h b -> HTTP.FullLazyResponse s h b Nothing
                                 _                    -> responseIN
                         else
                             responseIN 
 
-        httpVersionString = versionToString (requestHTTPVersion request)
+        httpVersionString = HTTP.versionToString (HTTP.requestVersion request)
 
         (status, responseHeaders) = case response of 
-                                        FullResponse      a b  _   -> (a, b)
-                                        FullLazyResponse  a b  _ _ -> (a, b)
-                                        ChukedResponse    a b  _   -> (a, b)
+                                        HTTP.FullResponse      a b  _   -> (a, b)
+                                        HTTP.FullLazyResponse  a b  _ _ -> (a, b)
+                                        HTTP.ChukedResponse    a b  _   -> (a, b)
 
         statusLine                = B.concat [httpVersionString, " ", statusCodeToStr status, crlf]
         keepAlive                 = case lookup H.Connection responseHeaders of 
@@ -141,7 +142,7 @@ responseHandler send (ParsingSuccess request) thunk settings =
         chunkedSender :: [ByteString] -> IO ()
         chunkedSender []     = void $ send chunkedEnd -- hex zero
         chunkedSender (x:xs) =  let chunkSize = B.length x
-                                    hexSize   = builderToStrict $ ((intToHex chunkSize) <> crlfBuilder)
+                                    hexSize   = intToHex (fromIntegral chunkSize)
                                 in  (send hexSize) >>
                                         send x >>
                                             send crlf >>
@@ -150,10 +151,10 @@ responseHandler send (ParsingSuccess request) thunk settings =
 
     case response of 
         -- If response is set to Manual we expect the developer to have taken care of everything
-        ManualResponse -> return False
+        HTTP.ManualResponse -> return False
         -- FullResposne asks the server to count the content and send it all. 
         -- Full response takes a full bytestring however we still send the data in smaller sizes of max 4kB each (4 KB will be set to a setting)
-        FullResponse   _ _ fullString    -> do
+        HTTP.FullResponse   _ _ fullString    -> do
                                                 let contentLength = (H.ContentLength, intToByteString $ B.length fullString)
                                                     headers       = (contentLength : dateHeader : responseHeaders) 
                                                     headerList    = map H.toSendRow headers
@@ -165,34 +166,34 @@ responseHandler send (ParsingSuccess request) thunk settings =
                                                                 keepAlive
         -- Full LazyResponbse is the same ass FullResponse Except that we expect a list of ByteStrings
         -- A Full Lazy Response requires a content Length parameter as well
-        FullLazyResponse _ _ chunkedString contentLengthIn -> do 
-                                                                let contentLength = (H.ContentLength , integerToByteString $ fromMaybe (fromIntegral (sum $ map B.length chunkedString)) contentLengthIn )
+        HTTP.FullLazyResponse _ _ chunkedString contentLengthIn -> do 
+                                                                let contentLength = (H.ContentLength , integerToByteString $ fromMaybe (fromIntegral (BL.length chunkedString)) contentLengthIn )
                                                                     headers       = (contentLength : dateHeader : responseHeaders)  
                                                                     headerList    = map H.toSendRow headers
 
                                                                 send statusLine  >>
                                                                     headerSender headerList >>
-                                                                        lazyDataSender chunkedString>>
+                                                                        lazyDataSender (BL.toChunks chunkedString)>>
                                                                             send crlf >>
                                                                                 keepAlive
         -- ChunkedResponse is a response where we use chunks to send data. This means that for every Byrestring in the list we send one cunk.
         -- This will only work on http/1.1 clients 
-        ChukedResponse _ _ chunkedString -> do  
+        HTTP.ChukedResponse _ _ chunkedString -> do  
                                                 let headers       = ( H.chunkedHeader : dateHeader : responseHeaders)
                                                     headerList    = map H.toSendRow headers
                                                 send statusLine >>
                                                     headerSender headerList >>
-                                                        chunkedSender chunkedString >>
+                                                        chunkedSender (BL.toChunks chunkedString) >>
                                                             send crlf >>
                                                                 keepAlive
 responseHandler s error _ _= 
   let status = case error of 
-                  URLTooLarge        -> statusCodeToStr 414 --" 414 Request-URI Too Long\n\r"
-                  InvalidVersion     -> statusCodeToStr 505 --" 505 HTTP Version Not Supported\n\r"
-                  InvalidMethod      -> statusCodeToStr 501 --" 405 Not Implemented\n\r"        
-                  HeaderLimitReached -> statusCodeToStr 413 --" 413 Request Entity Too Large\n\r"
-                  InvalidRequestLine -> statusCodeToStr 400 --" 400 Bad Request\n\r"
-                  LengthRequired     -> statusCodeToStr 411 --" 411 Length Required\n\r"
+                  HTTP.URLTooLarge        -> statusCodeToStr 414 --" 414 Request-URI Too Long\n\r"
+                  HTTP.InvalidVersion     -> statusCodeToStr 505 --" 505 HTTP Version Not Supported\n\r"
+                  HTTP.InvalidMethod      -> statusCodeToStr 501 --" 405 Not Implemented\n\r"        
+                  HTTP.HeaderLimitReached -> statusCodeToStr 413 --" 413 Request Entity Too Large\n\r"
+                  HTTP.InvalidRequestLine -> statusCodeToStr 400 --" 400 Bad Request\n\r"
+                  HTTP.LengthRequired     -> statusCodeToStr 411 --" 411 Length Required\n\r"
                   _                  -> statusCodeToStr 400 --" 400 Bad Request\n\r"
       response = B.concat [mainHTTPVersion, " ", status, crlf, crlf]
   in do 
@@ -212,17 +213,13 @@ serverThunk (sock, sockAddr) thunk settings =
             send :: ByteString -> IO Int
             send outData = B.sendTo sock outData sockAddr
 
-        bSocket    <- makeBufferedSocket sock  (readBufferSize settings)
+        bSocket    <- BS.makeBufferedSocket sock  (readBufferSize settings)
 
-        putStrLn "0"
         setRecvTimeout sock $ fromIntegral (readTimeout settings)
-        putStrLn "1"
         setSendTimeout sock $ fromIntegral(writeTimeout settings)
-        putStrLn "2"
         setSocketOption sock SendBuffer  (writeBufferSize settings) 
-        putStrLn "3"
         setSocketOption sock RecvBuffer  (readBufferSize settings)
-        putStrLn "4"
+
         case (socketKeepAlive settings) of 
             True ->  setSocketOption sock KeepAlive 1
             False -> return ()
@@ -233,7 +230,7 @@ serverThunk (sock, sockAddr) thunk settings =
                         timeStart    <- getCurrentTime
                         #endif
 
-                        request      <- readHTTPRequst bSocket send settings `E.catch` (\ e -> if isEOFError e then return ClientQuit else E.throw e ) 
+                        request      <- HTTP.readRequest bSocket send settings `E.catch` (\ e -> if isEOFError e then return HTTP.ClientQuit else E.throw e ) 
                         keepAlive    <- responseHandler send request thunk settings
 
                         #ifdef SMUTTDEBUG
@@ -241,8 +238,8 @@ serverThunk (sock, sockAddr) thunk settings =
                         putStrLn show $ diffUTCTime timeStart timeEnd
                         #endif 
 
-                        if and [ not $ connectionClosed request 
-                              , protocolCanKeepAlive request
+                        if and [ not $ HTTP.connectionClosed request 
+                              , HTTP.protocolCanKeepAlive request
                               , keepAlive]
                           then 
                             readLoop
