@@ -1,5 +1,5 @@
 {-----------------------------------------------------------------------------------------
-Module name: LambdaNova - a web server
+Module name: Smutt- a web server
 Made by:     Tomas Möre 2014
 
 
@@ -76,7 +76,7 @@ testResponse:: ByteString
 testResponse = "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nPong!\r\n"
 
 invalidReuqestResponse :: ByteString
-invalidReuqestResponse = B.append "HTTP/1.1 400 Bad Request" crlf
+invalidReuqestResponse = "HTTP/1.1 400 Bad Request" <> crlf
 
 
 
@@ -111,6 +111,7 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
                                         HTTP.FullResponse      a b  _   -> (a, b)
                                         HTTP.FullLazyResponse  a b  _ _ -> (a, b)
                                         HTTP.ChukedResponse    a b  _   -> (a, b)
+                                        HTTP.HeadersResponse   a b      -> (a, b)
 
         statusLine                = B.concat [httpVersionString, " ", statusCodeToStr status, crlf]
         keepAlive                 = case lookup H.Connection responseHeaders of 
@@ -119,25 +120,28 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
                                                     
 
         headerSender :: [ByteString] -> IO ()
-        headerSender a = if null a
-                            then  
-                                send crlf >> return () 
-                            else  
-                                let chunk = take 16 a
-                                    rest  = drop 16 a
-                                    readString = B.concat chunk
-                                in (send readString) >> headerSender rest
+        headerSender [] =   send crlf >> return () 
+        headerSender a  =   let chunk = take 16 a
+                                rest  = drop 16 a
+                                readString = B.concat chunk
+                            in (send readString) >> headerSender rest
 
         dataSender :: ByteString -> IO ()
-        dataSender "" = return ()
-        dataSender a = let  chunkSize = (writeBufferSize settings)
-                            chunk = B.take chunkSize a
-                            rest  = B.drop chunkSize a
-                        in send chunk >> dataSender rest
+        dataSender a = 
+            do
+                let chunkSize = (writeBufferSize settings)
+                    chunk     = B.take chunkSize a
+                    rest      = B.drop chunkSize a
+                send chunk  
+                if B.length rest > 0 
+                    then dataSender rest
+                    else return ()
+                
 
         lazyDataSender :: [ByteString] -> IO ()
         lazyDataSender [] = return ()
-        lazyDataSender (x:xs) =  dataSender x >> lazyDataSender xs
+        lazyDataSender (x:xs) =  dataSender x >> 
+                                    lazyDataSender xs
 
         chunkedSender :: [ByteString] -> IO ()
         chunkedSender []     = void $ send chunkedEnd -- hex zero
@@ -154,38 +158,48 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
         HTTP.ManualResponse -> return False
         -- FullResposne asks the server to count the content and send it all. 
         -- Full response takes a full bytestring however we still send the data in smaller sizes of max 4kB each (4 KB will be set to a setting)
-        HTTP.FullResponse   _ _ fullString    -> do
-                                                let contentLength = (H.ContentLength, intToByteString $ B.length fullString)
-                                                    headers       = (contentLength : dateHeader : responseHeaders) 
-                                                    headerList    = map H.toSendRow headers
+        HTTP.FullResponse   _ _ fullString    -> 
+            do
+                let contentLength = (H.ContentLength, intToByteString $ B.length fullString)
+                    headers       = (contentLength : dateHeader : responseHeaders) 
+                    headerList    = map H.toSendRow headers
 
-                                                send statusLine >> 
-                                                    headerSender headerList >> 
-                                                        dataSender fullString >> 
-                                                            send crlf >>
-                                                                keepAlive
+                send statusLine 
+                headerSender headerList
+                dataSender fullString
+                keepAlive
         -- Full LazyResponbse is the same ass FullResponse Except that we expect a list of ByteStrings
         -- A Full Lazy Response requires a content Length parameter as well
-        HTTP.FullLazyResponse _ _ chunkedString contentLengthIn -> do 
-                                                                let contentLength = (H.ContentLength , integerToByteString $ fromMaybe (fromIntegral (BL.length chunkedString)) contentLengthIn )
-                                                                    headers       = (contentLength : dateHeader : responseHeaders)  
-                                                                    headerList    = map H.toSendRow headers
+        HTTP.FullLazyResponse _ _ chunkedString contentLengthIn -> 
+            do 
+                let contentLength = (H.ContentLength , integerToByteString $ fromMaybe (fromIntegral (BL.length chunkedString)) contentLengthIn )
+                    headers       = (contentLength : dateHeader : responseHeaders)  
+                    headerList    = map H.toSendRow headers
 
-                                                                send statusLine  >>
-                                                                    headerSender headerList >>
-                                                                        lazyDataSender (BL.toChunks chunkedString)>>
-                                                                            send crlf >>
-                                                                                keepAlive
+                send statusLine 
+                headerSender headerList
+                lazyDataSender (BL.toChunks chunkedString)
+                keepAlive
         -- ChunkedResponse is a response where we use chunks to send data. This means that for every Byrestring in the list we send one cunk.
         -- This will only work on http/1.1 clients 
-        HTTP.ChukedResponse _ _ chunkedString -> do  
-                                                let headers       = ( H.chunkedHeader : dateHeader : responseHeaders)
-                                                    headerList    = map H.toSendRow headers
-                                                send statusLine >>
-                                                    headerSender headerList >>
-                                                        chunkedSender (BL.toChunks chunkedString) >>
-                                                            send crlf >>
-                                                                keepAlive
+        HTTP.ChukedResponse _ _ chunkedString -> 
+            do  
+                let headers       = ( H.chunkedHeader : dateHeader : responseHeaders)
+                    headerList    = map H.toSendRow headers
+                send statusLine
+                headerSender headerList
+                chunkedSender (BL.toChunks chunkedString)
+                send crlf
+                keepAlive
+        HTTP.HeadersResponse _ _              ->
+            do 
+                let headers     = (dateHeader:responseHeaders)
+                    headerList  = map H.toSendRow headers
+                send statusLine 
+                headerSender headerList
+                keepAlive
+                
+responseHandler _ HTTP.ClientQuit _ _ = return False 
 responseHandler s error _ _= 
   let status = case error of 
                   HTTP.URLTooLarge        -> statusCodeToStr 414 --" 414 Request-URI Too Long\n\r"
@@ -194,7 +208,8 @@ responseHandler s error _ _=
                   HTTP.HeaderLimitReached -> statusCodeToStr 413 --" 413 Request Entity Too Large\n\r"
                   HTTP.InvalidRequestLine -> statusCodeToStr 400 --" 400 Bad Request\n\r"
                   HTTP.LengthRequired     -> statusCodeToStr 411 --" 411 Length Required\n\r"
-                  _                  -> statusCodeToStr 400 --" 400 Bad Request\n\r"
+                  _                       -> statusCodeToStr 400 --" 400 Bad Request\n\r"
+
       response = B.concat [mainHTTPVersion, " ", status, crlf, crlf]
   in do 
       s response
@@ -203,7 +218,7 @@ responseHandler s error _ _=
 -- The main thunk of the server. This code is resposible for reading the request handing it over to the "real thunk"
 -- then sending the response in an appropiate manner along with closing down the socket and freeing the pointer
 serverThunk :: (Socket, SockAddr) -> WebThunk -> ServerSettings -> IO ()
-serverThunk (sock, sockAddr) thunk settings = 
+serverThunk fullSock@(sock, sockAddr) thunk settings = 
     do 
         #ifdef SMUTTDEBUG
         putStrLn $ "Accepted a new socket on:  " ++ (show sock) ++ " " ++ (show sockAddr)
@@ -213,12 +228,15 @@ serverThunk (sock, sockAddr) thunk settings =
             send :: ByteString -> IO Int
             send outData = B.sendTo sock outData sockAddr
 
-        bSocket    <- BS.makeBufferedSocket sock  (readBufferSize settings)
+        bSocket    <- BS.makeBufferedSocket fullSock  (readBufferSize settings)
+
+        --getTcpNoDelay sock >>= putStrLn . show 
+        setTcpNoDelay sock True
 
         setRecvTimeout sock $ fromIntegral (readTimeout settings)
         setSendTimeout sock $ fromIntegral(writeTimeout settings)
-        setSocketOption sock SendBuffer  (writeBufferSize settings) 
-        setSocketOption sock RecvBuffer  (readBufferSize settings)
+        --setSocketOption sock SendBuffer  (writeBufferSize settings) 
+        --setSocketOption sock RecvBuffer  (readBufferSize settings)
 
         case (socketKeepAlive settings) of 
             True ->  setSocketOption sock KeepAlive 1
@@ -239,15 +257,15 @@ serverThunk (sock, sockAddr) thunk settings =
                         #endif 
 
                         if and [ not $ HTTP.connectionClosed request 
-                              , HTTP.protocolCanKeepAlive request
-                              , keepAlive]
+                                , HTTP.protocolCanKeepAlive request
+                                , keepAlive]
                           then 
-                            readLoop
+                             readLoop
                           else 
                             return ()
          
-        readLoop >> 
-            sClose sock
+        readLoop
+        sClose sock
     where 
         bufferSize = readBufferSize settings
 

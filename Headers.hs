@@ -17,6 +17,7 @@ import Util
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Internal as BI
 import Data.Time.Clock
+import Data.Monoid
 
 type Header           = (HeaderName, ByteString)
 type Headers          = [Header]
@@ -94,7 +95,8 @@ data HeaderName =     AIM
                   |   Meter                     
                   |   Negotiate                 
                   |   Opt                       
-                  |   OrderingType             
+                  |   OrderingType
+                  |   Origin             
                   |   Overwrite                 
                   |   P3P                       
                   |   PEP                       
@@ -116,6 +118,10 @@ data HeaderName =     AIM
                   |   Range                     
                   |   Referer                   
                   |   RetryAfter
+                  |   SecWebSocketKey
+                  |   SecWebSocketProtocol
+                  |   SecWebSocketExtensions
+                  |   SecWebSocketVersion
                   |   TransferEncoding
                   |   Custom ByteString
                   deriving (Show, Eq, Read)
@@ -200,6 +206,7 @@ nameToString Meter                    = "Meter"
 nameToString Negotiate                = "Negotiate"
 nameToString Opt                      = "Opt"
 nameToString OrderingType             = "Ordering-Type"
+nameToString Origin                   = "Origin"
 nameToString Overwrite                = "Overwrite"
 nameToString P3P                      = "P3P"
 nameToString PEP                      = "PEP"
@@ -221,6 +228,10 @@ nameToString Public                   = "Public"
 nameToString Range                    = "Range"          
 nameToString Referer                  = "Referer"           
 nameToString RetryAfter               = "Retry-After"
+nameToString SecWebSocketExtensions   = "Sec-WebSocket-Extensions"
+nameToString SecWebSocketKey          = "Sec-WebSocket-Key"
+nameToString SecWebSocketProtocol     = "Sec-WebSocket-Protocol"
+nameToString SecWebSocketVersion      = "Sec-WebSocket-Version"
 nameToString TransferEncoding         = "Transfer-Encoding"
 nameToString (Custom str)             = str
 
@@ -296,6 +307,7 @@ stringToName "Meter"                      = Meter
 stringToName "Negotiate"                  = Negotiate
 stringToName "Opt"                        = Opt
 stringToName "Ordering-Type"              = OrderingType
+stringToName "Origin"                     = Origin
 stringToName "Overwrite"                  = Overwrite
 stringToName "P3P"                        = P3P
 stringToName "PEP"                        = PEP
@@ -317,6 +329,10 @@ stringToName "Public"                     = Public
 stringToName "Range"                      = Range
 stringToName "Referer"                    = Referer
 stringToName "Retry-After"                = RetryAfter
+stringToName "Sec-WebSocket-Extensions"   = SecWebSocketExtensions
+stringToName "Sec-WebSocket-Key"          = SecWebSocketKey
+stringToName "Sec-WebSocket-Version"      = SecWebSocketVersion
+stringToName "Sec-WebSocket-Protocol"     = SecWebSocketProtocol
 stringToName "Transfer-Encoding"          = TransferEncoding
 stringToName  str                         = Custom str
 
@@ -325,7 +341,7 @@ toString (a, b) = B.concat [(nameToString a), ": ", b]
 
 headersToString:: Headers -> ByteString
 headersToString []     = ""
-headersToString (x:xs) = B.append (toString x) (headersToString xs)
+headersToString (x:xs) = (toString x) <> (headersToString xs)
 
 toSendRow:: Header -> ByteString
 toSendRow s = B.append (toString s) crlf 

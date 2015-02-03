@@ -14,6 +14,7 @@ import qualified Data.ByteString           as B
 import qualified Data.ByteString.Internal  as BI
 import qualified Data.ByteString.Lazy      as BL
 import qualified Data.ByteString.Builder   as BB 
+import qualified Data.CaseInsensitive as CI
 
 import Data.Time.Calendar.WeekDate 
 import Data.Time
@@ -25,12 +26,16 @@ import Data.Word
 import Data.Fixed 
 
 import Data.Monoid
-
+import Data.Bits
 
 import Data.Word
 
 type ByteString       = B.ByteString
 
+
+unsafeCond :: [(Bool,a)] -> a 
+unsafeCond ((True, a):_) = a
+unsafeCond (_: xs) = unsafeCond xs 
 
 
 
@@ -140,8 +145,18 @@ stripWhitespace a = let firstClean      = B.dropWhile BI.isSpaceWord8 a
                         (finalClean, _) = B.spanEnd BI.isSpaceWord8 firstClean
                     in finalClean
 
+quickQIEqual a b = (CI.mk a) == (CI.mk b)
+
 picoToSeconds :: Pico -> Int
 picoToSeconds a = div' a (10 ^ 12) :: Int
+
+shiftWordTo :: (Bits a, Num a) => [Word8] -> a 
+shiftWordTo [] = 0
+shiftWordTo (x:xs) = 
+    (shift (fromIntegral x) shiftBytes) + shiftWordTo xs 
+    where 
+        shiftBytes = (length xs) * 8
+
 
 getDayName :: Int -> ByteString
 getDayName 1 = "Mon"

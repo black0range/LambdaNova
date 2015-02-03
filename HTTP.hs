@@ -68,6 +68,11 @@ instance Show Version where
     show HTTP10 = "HTTP/1.0"
     show HTTP11 = "HTTP/1.1"
 
+isHTTP11 = (==HTTP11) 
+isHTTP10 = (==HTTP10)
+isHTTP09 = (==HTTP09)
+
+
 data Method = OPTIONS | GET | HEAD | POST | PUT | DELETE | TRACE | CONNECT 
     deriving(Show, Eq)
 
@@ -79,6 +84,7 @@ isPUT     = (==PUT)
 isDELETE  = (==DELETE)
 isTRACE   = (==TRACE)
 isCONNECT = (==CONNECT)
+
 
 data Request      = Request {  requestMethod       :: Method
                              , requestPath         :: PathFragments
@@ -116,7 +122,21 @@ instance Show Request where
                                   , show buffered
                                   , ">>"]
 
+reqIsOPTIONS = isOPTIONS  . requestMethod
+reqIsPOST    = isPOST     . requestMethod
+reqIsGET     = isGET      . requestMethod
+reqIsHEAD    = isHEAD     . requestMethod
+reqIsPUT     = isPUT      . requestMethod
+reqIsDELETE  = isDELETE    . requestMethod
+reqIsTRACE   = isTRACE    . requestMethod
+reqIsCONNECT = isCONNECT  . requestMethod
 
+reqIsHTTP11 = isHTTP11  . requestVersion 
+reqIsHTTP10 = isHTTP10  . requestVersion
+reqIsHTTP09 = isHTTP09  . requestVersion
+
+
+reqHasHeader header = isJust . lookup header . requestHeaders  
 {-
 -------------
 FullResponse
@@ -152,6 +172,7 @@ If there
 data Response =   FullResponse      !StatusCode !ResponseHeaders !ByteString
                 | FullLazyResponse  !StatusCode !ResponseHeaders BL.ByteString !(Maybe ContentLength)
                 | ChukedResponse    !StatusCode !ResponseHeaders BL.ByteString
+                | HeadersResponse   !StatusCode !ResponseHeaders
                 | ManualResponse 
 
 data ParsingResult =  ParsingSuccess Request 
@@ -194,9 +215,7 @@ parseVersion "HTTP/1.0" = Just HTTP10
 parseVersion "HTTP/1.1" = Just HTTP11
 parseVersion _          = Nothing
 
-isHTTP11 = (==HTTP11) 
-isHTTP10 = (==HTTP10)
-isHTTP09 = (==HTTP09)
+
 
 requestIsHTTP11 = isHTTP11 . requestVersion
 requestIsHTTP10 = isHTTP10 . requestVersion
@@ -273,23 +292,19 @@ readHeaders bSocket maxLineLength maxNrHeaders = readHeadersReal bSocket  maxLin
 readRequest :: BufferedSocket -> (ByteString -> IO Int) -> ServerSettings -> IO ParsingResult
 readRequest bSocket  send settings =
   do 
-    maybeFirstLine          <- BS.getLine (maxPathLegnth settings) bSocket
-    headerStrListAttempt    <- readHeaders bSocket (maxHeaderLength settings) (maxHeaderCount settings)
+    maybeFirstLine@(Just firstLine) <- BS.getLine (maxPathLegnth settings) bSocket
+    headerStrListAttempt            <- readHeaders bSocket (maxHeaderLength settings) (maxHeaderCount settings)
 
     -- Warding a few of these statments are unsafe and might throw an exception if not handeled carefully.
     -- 
     let   
-        HeaderSuccess headerStrList                = headerStrListAttempt     
-
-        Just firstLine                             = maybeFirstLine
+        HeaderSuccess headerStrList                = headerStrListAttempt 
         firstLineSplit                             = B.words firstLine
         (strRequestType:strPathFull:strVersion:_)  = firstLineSplit
 
-        versionTest                                = parseVersion strVersion
-        Just version                               = versionTest
+        versionTest@(Just version)                 = parseVersion strVersion
 
-        requestMethodTest                          = parseMethod strRequestType
-        Just requestMethod                         = requestMethodTest
+        requestMethodTest@(Just requestMethod)     = parseMethod strRequestType
 
         headerList                                 = parseHeaders headerStrList
 

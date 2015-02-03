@@ -13,7 +13,7 @@ data ServerData       = ServerData {  currentConnections         :: IORef Intege
                                     , secondsSinceLastConnection :: Integer
                                     }
                                     -}
-data ServerSettings  = ServerSettings {  readBufferSize   :: Int                                       
+data ServerSettings  = ServerSettings {  readBufferSize    :: Int                                       
                                         , writeBufferSize  :: Int
                                         , maxConnections   :: Int
 
@@ -31,8 +31,8 @@ defaultSettings       =  ServerSettings  {  readBufferSize  = (8 * 1024)  -- 8 K
                                           , writeBufferSize = (8 * 1024)  -- 8 KB
                                           , maxConnections  = 1024
                                           , socketKeepAlive = False
-                                          , readTimeout     = 15000000
-                                          , writeTimeout    = 30000000
+                                          , readTimeout     = 5000000
+                                          , writeTimeout    = 5000000
                                           , keepServing     = Nothing 
                                           , maxPathLegnth   = 1024
                                           , maxHeaderLength = 1024

@@ -21,13 +21,14 @@ import qualified Data.ByteString           as B
 import qualified Data.ByteString.Internal  as BI
 import qualified Data.ByteString.Lazy      as BL
 import qualified Data.ByteString.Builder   as BB 
+
 import Data.IORef
-import Network.Socket
+import Network.Socket hiding (send) -- ns for native socket  
 
 import System.IO.Unsafe -- I'm so sorry for this
 
 import Foreign.ForeignPtr
-
+import Data.Monoid
 import Data.Word 
 
 type MaxLineLength    = Int
@@ -38,16 +39,12 @@ type ExcessData       = IORef ByteString
 
 type ReadSize         = Int 
 -- This buffered socket is read by first checking the bufferData ByteString. If that is not enought buffer a bit more data... etc
-type BufferedSocket   = (Socket, (ForeignPtr Word8), BufferSize, ExcessData)
+type BufferedSocket   = ((Socket,SockAddr), (ForeignPtr Word8), BufferSize, ExcessData)
 
 type Read = Int  
 
 
-unsafeCond :: [(Bool,a)] -> a 
-unsafeCond ((True, a):_) = a
-unsafeCond (_: xs) = unsafeCond xs 
-
-makeBufferedSocket :: Socket -> BufferSize -> IO BufferedSocket
+makeBufferedSocket :: (Socket, SockAddr) -> BufferSize -> IO BufferedSocket
 makeBufferedSocket sock  bufferSize = 
     do
       bufferData       <- newIORef  "" 
@@ -64,6 +61,11 @@ writeExcessData  (_, _, _,excessData)  = writeIORef excessData
 clearExcessData  :: BufferedSocket -> IO ()
 clearExcessData  bSocket = writeExcessData  bSocket  ""
 
+bytesInExcessData :: BufferedSocket -> IO Int 
+bytesInExcessData  = fmap B.length . readExcessData
+
+prependExcessData :: BufferedSocket -> ByteString ->IO ()
+prependExcessData b s = (readExcessData b) >>= writeExcessData b . (<>s)
 
 readNExcessData :: BufferedSocket -> Int -> IO (Int, ByteString)
 readNExcessData bSocket n =
@@ -97,7 +99,7 @@ breakSubstringExcessData bSocket str =
                 _  -> (writeExcessData bSocket $ B.drop (B.length str) rest) `seq` Just relevant   
 -- Doesn't care about allready read data 
 fillBuffer :: BufferedSocket -> IO Int
-fillBuffer (socket, buffer, bufferSize,_) = 
+fillBuffer ((socket,_), buffer, bufferSize,_) = 
     fmap fst (withForeignPtr buffer socketReader)
     where
         socketReader ptr = recvBufFrom socket ptr bufferSize
@@ -233,7 +235,7 @@ getLineReal bSocket buffered  maxLength =
                 let crlfSplit    = B.breakSubstring crlf string
                     stringLength = B.length string
                 case crlfSplit of
-                            (_,"")               -> getLineReal bSocket (B.append buffered string) maxLength
+                            (_,"")               -> getLineReal bSocket (buffered <> string) maxLength
                             (returnString, rest) -> do   
                                                         writeExcessData bSocket (B.drop crlfLength rest)
                                                         return $ Just returnString
@@ -261,8 +263,21 @@ getLine maxLength bSocket  =
     where 
         stringToBig = (maxLength <=) . B.length 
 
+--sendLazy :: BufferedSocket -> BL.ByteString -> IO ()
 
 
+send :: BufferedSocket -> ByteString -> IO () 
+send bSocket string = 
+    do 
+        sent       <- withForeignPtr fPtr (\ ptr -> sendBufTo sock ptr len sockAddr) 
+        if sent < len
+            then 
+                send bSocket (B.drop sent string)
+            else 
+                return () 
+    where 
+        ((sock,sockAddr),_,_,_) = bSocket 
+        (fPtr, _, len) = BI.toForeignPtr string
 
 
 
