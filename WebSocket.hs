@@ -22,7 +22,7 @@ import qualified Data.ByteString.Lazy as BL
 import qualified Data.CaseInsensitive as CI
 import qualified Data.Text as T 
 import qualified Data.Text.Lazy as TL 
-
+import Data.Text.Encoding
 import qualified BufferedSocket as BS 
 
 import Data.Maybe 
@@ -47,26 +47,24 @@ type FrameSize      = Int -- Positive Int either 16 or 64
 type Masked         = Bool 
 type WebSocketThunk = (Request -> IO Response)
 
+
 type CloseStatusCode = Word16
 -- Websocket magic number, don't blame me!! :'(
 guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
-data Response =   TextResponse      !T.Text
-                | LazyTextResponse  TL.Text 
-                | BinaryResponse    !B.ByteString
-                | LazyBinaryResponse BL.ByteString
+data Response =   TextResponse   TL.Text 
+                | BinaryResponse BL.ByteString
+                | CloseResponse  StatusCode B.ByteString
                 | NoResponse 
-                | CloseResponse StatusCode B.ByteString
                 | QuitWebSockets 
 
-data Request  =   TextResponse       !T.Text
-                | LazyBinaryResponse  B.ByteString
-                | TextResponse       !T.Text
-                | LazyTextResponse    TL.Text
-                | CloseRequest StatusCode B.ByteString
-                | Ping 
-                | Pong 
+data Request  =   BinaryRequest  BL.ByteString
+                | TextRequest    TL.Text
+                | CloseRequest   StatusCode TL.ByteString
+                | PingRequest    BL.ByteString
+                | PongRequest    BL.ByteString
+                | InvalidRequest
 
 -- 
 data SocketStatus = IORef Bool 
@@ -80,6 +78,14 @@ data AuthenticationData = {
     , webSocketProtocol :: [ByteString]
     , socketExtensions  :: [ByteString]
 } 
+data FrameHeader = FrameHeader Fin OpCode Masked Mask PayloadLength
+
+isFin    (FrameHeader fin _ _ _ _ )    = fin
+opCode   (FrameHeader _ code _ _ _ )   = code 
+isMasked (FrameHeader _ _ masked _ _ ) = masked
+getMask  (FrameHeader _ _ _ mask _ )   = mask 
+getPayLoadLength (FrameHeader _ _ _ _ len ) = length  
+
 
 makeWebsocketExtensionList :: H.Headers -> [ByteString]
 makeWebsocketExtensionList [] = []
@@ -95,18 +101,33 @@ authenticateHandshake  req =
         Just a  -> Left a 
         Nothing -> Right authenticationData
     where 
-        headers = HTTP.requestHeaders req 
+        headers                                             = HTTP.requestHeaders req 
 
         -- Lookups off diffrent header values and making just variables 
-        maybeHost@(Just host)                               = lookup H.Host $ headers
-        maybeUpgrade@(Just upgrade)                         = lookup H.Upgrade $ headers
-        maybeConnection@(Just connection)                   = lookup H.Host $connection
+        maybeHost                                           = lookup H.Host $ headers
+        Just host                                           = maybeHost
+
+        maybeUpgrade                                        = lookup H.Upgrade $ headers
+        Just upgrade                                        = maybeUpgrade
+
+        maybeConnection                                     = lookup H.Host $connection
+        Just connection                                     =  maybeConnection
+
         maybeOrigin                                         = lookup H.Origin $ headers
-        maybeWebSocketKey@(Just webSocketKey)               = lookup H.SecWebSocketKey $ headers
-        maybeWebSocketVersion@(Just webSocketVersion)       = lookup H.SecWebSocketVersion $ headers
-        maybeWebSocketProtocol@(Just webSocketProtocol)     = lookup H.SecWebSocketProtocol $ headers
+        maybeWebSocketKey                                   = lookup H.SecWebSocketKey $ headers
+        Just webSocketKey                                   = maybeWebSocketKey
+
+
+        maybeWebSocketVersion                               = lookup H.SecWebSocketVersion $ headers
+        Just webSocketVersion                               = maybeWebSocketVersion
+
+        maybeWebSocketProtocol                              = lookup H.SecWebSocketProtocol $ headers
+        Just webSocketProtocol                              = maybeWebSocketProtocol
+
         --maybeWebSocketExtensions@(Just webSocketExtensions) = lookup H.SecWebSocketExtensions $ headers
-        keyDecoded@(Right keyBytestring)                    = B64.decode webSocketKey
+        keyDecoded                                          = B64.decode webSocketKey
+        Right keyBytestring                                 = keyDecoded
+
         keyIsValid                                          = and [isRight keyDecoded, (B.length keyBytestring) == 16]
 
         webSocketVersonInt                                  = byteStringToInteger webSocketVersion
@@ -144,14 +165,13 @@ acceptHandshake req authData =
 withWebSockets :: HTTTP.Request -> WebSocketThunk -> IO HTTP.Response 
 withWebSockets req thunk = 
     if isRight eitherAuthentication
-        then 
-            do 
-                let Right authData = eitherAuthentication
-                acceptHandshake req  authData
+        then do 
+            let Right authData = eitherAuthentication
+            acceptHandshake req  authData
 
-                return HTTP.Manual
-        else 
-            return HTTP.HeadersResponse 400 [(H.Connection, "close")]
+            return HTTP.Manual
+
+        else return $ HTTP.HeadersResponse 400 [(H.Connection, "close")]
 
     where 
         eitherAuthentication = authenticateHandshake request
@@ -161,42 +181,86 @@ serve :: BufferedSocket ->  WebSocketThunk -> IO ()
 serve bSocket thunk = 
     do 
 
-readMessage :: BufferedSocket -> IO Request
-readMessage = 
+--ConinuationFrame | TextFrame | BinaryFrame | ConnectionClose | Ping | Pong | Reserved | Undefined 
+readFrames :: BufferedSocket -> OpCode -> WebSocketThunk -> IO Request
+readFrames bSocket primeOp thunk = do
+    fHead@(FrameHeader fin frameOpCode masked mask payloadLength) <- readFrameHeader bSocket
+    if frameOpCode == ConinuationFrame 
+        then case primeOp of 
+            TextFrame   -> do   next      <- nextStep
+                                inBytes   <- readBody
+                                return $ map decodeUtf8 inBytes <> next
+
+            BinaryFrame -> do   next    <- nextStep
+                                current <- readBody
+                                return $ outData current <> next
+    else case frameOpCode of 
+            Ping -> do
+                inBytes   <- readBody
+                respondToPing bSocket fHead 
+                loop 
+            Pong -> do 
+                inBytes   <- readBody
+                thunk $ PongRequest $ BL.fromChunks
+                respondToPing bSocket fHead inBytes
+                inBytes `seq` loop
+            ConnectionClose -> do 
+                inBytes   <- readBody
+                thunk (CloseRequest )
+
+    where 
+        (FrameHeader _ headOpCode _ _ _)  = fHead
+        loop     = readFrames bSocket fHead thunk
+        nextStep = if if fin then return [] else unsafeInterLeaveIO loop
+        outData bytes = if isMaked fHead
+                        then unmask (getMask fHead) a
+                        else a
+        readBody = outData <$> BS.readLazy bSocket payloadLength
+-- The thunk is in case of any special headers 
+readMessage :: BufferedSocket -> WebSocketThunk -> IO Request
+readMessage bSocket thunk = do 
+    (FrameHeader fin opCode masked mask payloadLength) <- readFrameHeader bSocket
+    case opCode of 
+
+--ConinuationFrame | TextFrame | BinaryFrame | ConnectionClose | Ping | Pong | Reserved | Undefined 
 
 readFrameHeader :: BufferedSocket -> IO Frame
 readFrameHeader bSocket = 
-    do 
-       frameHeader <- BS.readN bSocket 10 
-       let (b1:b2)  = B.unpack $ B.take 2 frameHeader
-            fin     = isFin b1
-            opCode  = toOpCode b1
-            hasMask = isMaked b2 
-            eitherPayload = (payloadLength8 b2) 
+    do byte1  <- BS.readByte bSocket
+       byte2 <- BS.readByte bSocket 
+       let  fin     = isFin byte1 
+            opCode  = toOpCode $ extractOpCode byte1
+            hasMask = extractIsMaksed byte2 
+            eitherPayload = (payloadLength8 byte2) 
             Right smallPayload   = eitherPayload
-            nExtendedBytes  = if isRight eitherPayload then 0 else let Left a = eitherPayload in a 
+            nExtendedBytes  = if isRight eitherPayload 
+                                then 0 
+                                else let Left a = eitherPayload 
+                                     in a 
+        extendedBytes <- B.unpack <$> BS.read bSocket nExtendedBytes
 
-            (extendBytes:rest1)    =   B.splitAt nExtendedBytes (B.drop 2 frameHeader) -- 2 from first split 
-            extendedPayloadLength = shiftWordTo  (B.unpack extendBytes) shiftWordTo
+        let extendedPayloadLength = shiftWordTo  extendedBytes 
 
-            realPayload     = if nExtendedBytes == 0 then  smallPayload else extendedPayloadLength
+            realPayload     = if nExtendedBytes == 0 
+                                then smallPayload 
+                                else extendedPayloadLength
 
-            (maskString:rest2) = B.splitAt (if hasMask then 4 else 0) test
-            maskList = case maskString of 
+        maskString <- BS.read bSocket (if hasMask then 4 else 0) 
+
+        let maskList = case maskString of 
                         "" -> Nothing 
-                        _  -> cycle $ B.unpack maskString
-        appendExcessData bSocket rest2
+                        _  -> Just $ cycle $ B.unpack maskString
 
-        return $ Frame fin opcode masked maskList realPayload
+        return $ FrameHeader fin opcode masked maskList realPayload
 
-data FrameHeader = FrameHeader Fin OpCode Masked Mask PayloadLength Body
+
 {-
 
 Table From http://datatracker.ietf.org/doc/rfc6455/?include_text=1 describing the bit table of a frame. 
 This is used to make the functions under 
  0                   1                   2                   3
       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-     +-+-+-+-+-------+-+-------------+-------------------------------+
+     +-+-+d-+-+-------+-+-------------+-------------------------------+
      |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
      |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
      |N|V|V|V|       |S|             |   (if payload len==126/127)   |
@@ -255,8 +319,18 @@ toOpCode n
         isUndefined = (0x3 >= n && 0x7 <= n)
         isReserved  = n >= 0xB
 -- zeroes any FIN or RSV bits 
-getOpCode :: Word8 -> OpCode 
-getOpCode = toOpCode . (240 .&.) 
+extractOpCode :: Word8 -> OpCode 
+extractOpCode = toOpCode . (240 .&.) 
+
+fromOpCode :: OpCode -> Word8 
+fromOpCode ConinuationFrame = 0x0
+fromOpCode TextFrame        = 0x1
+fromOpCode BinaryFrame      = 0x2
+fromOpCode ConnectionClose  = 0x8
+fromOpCode Ping             = 0x9
+fromOpCode Pong             = 0xA
+
+
 {-
  Mask:  1 bit
 
@@ -266,8 +340,8 @@ getOpCode = toOpCode . (240 .&.)
       client to server have this bit set to 1.
 -}
 -- Same function as isFin
-isMaksed :: Word8 -> Bool 
-isMasked = isFin
+extractIsMaksed :: Word8 -> Bool 
+extractIsMaksed = isFin
 
 -- Nulls the leftmost bit. IF the remaing is 126 then read extended payload of 16 bytes or if 127 read extended payload of 
 payloadLength8 :: Word8 -> Either FrameSize PayloadLength
@@ -296,3 +370,26 @@ statusCodeToByteString  MessageTooBig       = "\ETX\241" -- 1009
 statusCodeToByteString  NeedsExtension      = "\ETX\242" -- 1010
 statusCodeToByteString  UnexpectedCondition = "\ETX\243" -- 1011
 statusCodeToByteString  CusomCode w16       = BINARY.encode w16
+
+
+-- First argument MUST be a cycled mask of bytes
+
+unmasker :: Mask -> Word8 -> (CycledMask, Word8)
+unmasker (maskByte:maskRest) byte = (maskRest, xor byte maskByte)
+
+unmask :: Mask -> [ByteString] -> [ByteString]
+unmask _ [] = []
+unmask mask (currentString:unmakskedRest) = 
+    let (maskRest, unmasked) = mapAccumL unmasker mask currentString
+    in  (unmasked:unmask maskRest unmakskedRest)
+
+
+respondToPing :: BufferedSocket -> FrameHeader -> [ByteString] -> IO ()
+respondToPing bSocket fHeader byteString = 
+
+
+
+
+
+
+

@@ -36,7 +36,7 @@ import Control.Monad
 import qualified BufferedSocket as BS  
 
 type BufferedSocket = BS.BufferedSocket
-type MaxLineLength  = BS.MaxLineLength
+type MaxLineLength  = BS.MaxLength
 
 type PathString       = ByteString
 
@@ -99,8 +99,7 @@ data Request      = Request {  requestMethod       :: Method
 
 
 instance Show Request where
-  show httpRequest =  let (sock, buffer, bufSize, bufferDataRef) = bufSocket httpRequest
-                          buffered     = unsafePerformIO (readIORef bufferDataRef)
+  show httpRequest =  let bSocket = bufSocket httpRequest
                       in  unwords [ "<HTTPRequest"
                                   ,"Type: "
                                   , show $ requestMethod httpRequest
@@ -110,16 +109,6 @@ instance Show Request where
                                   , show $ requestPath httpRequest
                                   , "  Headers: "
                                   , show $ requestHeaders httpRequest
-                                  , "  bSocket: "
-                                  , "<bufferedSocket "
-                                  , "socket: "
-                                  , show sock
-                                  , " bufferAddr: "
-                                  , show buffer
-                                  , " bufferSize: "
-                                  , show bufSize
-                                  , " buffered: "
-                                  , show buffered
                                   , ">>"]
 
 reqIsOPTIONS = isOPTIONS  . requestMethod
@@ -256,8 +245,8 @@ parseHeaders inData  = [splitted | raw <- inData, let splitted = headerSplitter
 
 
 
-send100Continue:: (ByteString -> IO Int)   -> Version -> Maybe (IO ())
-send100Continue sender HTTP11 = Just $ void $ sender "HTTP/1.1 100 Continue\n\r\n\r" 
+send100Continue:: BufferedSocket  -> Version -> Maybe (IO ())
+send100Continue bSocket HTTP11 = Just $ void $ BS.send bSocket  "HTTP/1.1 100 Continue\n\r\n\r" 
 send100Continue _  _ = Nothing
 
 
@@ -267,8 +256,7 @@ readHeadersReal :: BufferedSocket -> MaxLineLength ->  Int -> Int -> IO [ByteStr
 readHeadersReal bSocket maxLineLength maxNrHeaders iteration headers=
     case iteration >= maxNrHeaders of 
         True -> return TooManyHeaders
-        False ->   do
-                      lineResult <- BS.getLine maxLineLength bSocket
+        False ->   do lineResult <- BS.getLine maxLineLength bSocket
                       case lineResult of 
                         Nothing   -> return HasMaxLineLength
                         Just ""   -> fmap HeaderSuccess headers
@@ -289,22 +277,26 @@ readHeaders bSocket maxLineLength maxNrHeaders = readHeadersReal bSocket  maxLin
 
 -- Reads the full http request from a bufferd socket
 -- Be a bit cautious as it is possible that this can fail and throw an exception
-readRequest :: BufferedSocket -> (ByteString -> IO Int) -> ServerSettings -> IO ParsingResult
-readRequest bSocket  send settings =
+readRequest :: BufferedSocket  -> ServerSettings -> IO ParsingResult
+readRequest bSocket settings =
   do 
-    maybeFirstLine@(Just firstLine) <- BS.getLine (maxPathLegnth settings) bSocket
+    maybeFirstLine                  <- BS.getLine (maxPathLegnth settings) bSocket
     headerStrListAttempt            <- readHeaders bSocket (maxHeaderLength settings) (maxHeaderCount settings)
 
     -- Warding a few of these statments are unsafe and might throw an exception if not handeled carefully.
     -- 
-    let   
+    let
+        Just firstLine                             = maybeFirstLine
+
         HeaderSuccess headerStrList                = headerStrListAttempt 
         firstLineSplit                             = B.words firstLine
         (strRequestType:strPathFull:strVersion:_)  = firstLineSplit
 
-        versionTest@(Just version)                 = parseVersion strVersion
+        versionTest                                = parseVersion strVersion
+        Just version                               = versionTest
 
-        requestMethodTest@(Just requestMethod)     = parseMethod strRequestType
+        requestMethodTest                          = parseMethod strRequestType
+        Just requestMethod                         = requestMethodTest
 
         headerList                                 = parseHeaders headerStrList
 
@@ -352,10 +344,10 @@ readRequest bSocket  send settings =
                                                                     else 
                                                                         do 
                                                                             let Just len = maybeContentLengthInt 
-                                                                            bodyList <- unsafeInterleaveIO $ BS.readNLazy bSocket len
+                                                                            bodyList <- unsafeInterleaveIO $ BS.readLazy bSocket len
                                                                             return $ bodyList 
                                                             else 
-                                                                return []
+                                                                return ""
 
         requestData                                = Request {  requestMethod       = requestMethod
                                                               , requestPath         = pathSplit
@@ -365,7 +357,7 @@ readRequest bSocket  send settings =
                                                               , requestHeaders      = headerList
                                                               , requestCookies      = cookieList   
                                                               , bufSocket           = bSocket
-                                                              , requestBody         = fmap BL.fromChunks bodyReader
+                                                              , requestBody         = bodyReader
                                                                   }
 
          -- These requirements will be checked first. If these are a success the server might send a "100 Continue" response once (if the httpversion is 1.1) 
@@ -386,10 +378,9 @@ readRequest bSocket  send settings =
                         ,  ( otherwise ,  ParsingSuccess requestData)
                         ]
 
-
     case lookup True essesialRequirements1 of
         Just a  ->  return a
-        Nothing ->  (fromMaybe (return ()) $ send100Continue send version) >>
+        Nothing ->  (fromMaybe (return ()) $ send100Continue bSocket version) >>
                     case lookup True conditionList of
                         Just a -> return a
                         Nothing -> error "Something fucked up badly"

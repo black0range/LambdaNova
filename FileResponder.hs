@@ -34,7 +34,7 @@ fileSender fp =
             maybeFileSize =  Just $ fromIntegral fileSize
 
         fileContent <-   unsafeInterleaveIO $ fmap BL.fromChunks $ fileReader handle chunkList
-        return $ HTTP.FullLazyResponse 200 [(H.ContentType, "image/jpg")] (fileContent) maybeFileSize
+        return $ HTTP.FullLazyResponse 200 [(H.ContentType, "Image/JPG")] (fileContent) maybeFileSize
 
 
 

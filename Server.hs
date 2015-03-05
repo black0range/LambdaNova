@@ -39,7 +39,7 @@ import Network.Socket.Options
 
 
 import qualified Network.Socket.ByteString as B
-import qualified Data.ByteString           as B  hiding (pack)
+import qualified Data.ByteString           as B  hiding (pack, putStrLn)
 import qualified Data.ByteString.Char8     as B  hiding (findSubstring, elemIndex, split, break, spanEnd, dropWhile)
 import qualified Data.ByteString.Internal  as BI
 import qualified Data.ByteString.Builder   as BB
@@ -84,8 +84,8 @@ invalidReuqestResponse = "HTTP/1.1 400 Bad Request" <> crlf
 -- This function handles the response to the request. 
 showExcept a = putStrLn $ "Exception: " ++ show a 
 
-responseHandler :: (ByteString -> IO Int) -> HTTP.ParsingResult -> WebThunk -> ServerSettings ->IO KeepGoing
-responseHandler send (HTTP.ParsingSuccess request) thunk settings = 
+responseHandler :: BS.BufferedSocket -> HTTP.ParsingResult -> WebThunk -> ServerSettings ->IO KeepGoing
+responseHandler bSocket (HTTP.ParsingSuccess request) thunk settings = 
   do
     responseIN <- (thunk request) `E.catches` [ E.Handler (\ (ex :: E.ErrorCall )     -> showExcept ex >> ERROR.internalServerError)
                                               , E.Handler (\ (ex :: E.IOException)    -> showExcept ex >> ERROR.internalServerError)
@@ -95,6 +95,7 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
     -- Date header for responses 
    
     let 
+        send = BS.send bSocket 
         -- A security check to make sure that the response wont be sent as chunked if the HTTP version isn't able to handle it
         -- A warning to the developer should be that if the chunked encoding is sent and the HTTP version isn't correct this might take up a lot of ram
         response = if (HTTP.requestVersion request) < HTTP.HTTP11 
@@ -124,7 +125,7 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
         headerSender a  =   let chunk = take 16 a
                                 rest  = drop 16 a
                                 readString = B.concat chunk
-                            in (send readString) >> headerSender rest
+                            in (send  readString) >> headerSender rest
 
         dataSender :: ByteString -> IO ()
         dataSender a = 
@@ -155,7 +156,7 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
 
     case response of 
         -- If response is set to Manual we expect the developer to have taken care of everything
-        HTTP.ManualResponse -> return False
+        HTTP.ManualResponse -> return ()
         -- FullResposne asks the server to count the content and send it all. 
         -- Full response takes a full bytestring however we still send the data in smaller sizes of max 4kB each (4 KB will be set to a setting)
         HTTP.FullResponse   _ _ fullString    -> 
@@ -167,7 +168,7 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
                 send statusLine 
                 headerSender headerList
                 dataSender fullString
-                keepAlive
+                
         -- Full LazyResponbse is the same ass FullResponse Except that we expect a list of ByteStrings
         -- A Full Lazy Response requires a content Length parameter as well
         HTTP.FullLazyResponse _ _ chunkedString contentLengthIn -> 
@@ -179,7 +180,7 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
                 send statusLine 
                 headerSender headerList
                 lazyDataSender (BL.toChunks chunkedString)
-                keepAlive
+                
         -- ChunkedResponse is a response where we use chunks to send data. This means that for every Byrestring in the list we send one cunk.
         -- This will only work on http/1.1 clients 
         HTTP.ChukedResponse _ _ chunkedString -> 
@@ -190,17 +191,20 @@ responseHandler send (HTTP.ParsingSuccess request) thunk settings =
                 headerSender headerList
                 chunkedSender (BL.toChunks chunkedString)
                 send crlf
-                keepAlive
+                
         HTTP.HeadersResponse _ _              ->
             do 
                 let headers     = (dateHeader:responseHeaders)
                     headerList  = map H.toSendRow headers
                 send statusLine 
                 headerSender headerList
-                keepAlive
                 
+    requestBody <- HTTP.requestBody request
+    keepAlive
+
+
 responseHandler _ HTTP.ClientQuit _ _ = return False 
-responseHandler s error _ _= 
+responseHandler bSocket error _ _= 
   let status = case error of 
                   HTTP.URLTooLarge        -> statusCodeToStr 414 --" 414 Request-URI Too Long\n\r"
                   HTTP.InvalidVersion     -> statusCodeToStr 505 --" 505 HTTP Version Not Supported\n\r"
@@ -212,7 +216,7 @@ responseHandler s error _ _=
 
       response = B.concat [mainHTTPVersion, " ", status, crlf, crlf]
   in do 
-      s response
+      BS.send bSocket response
       return False
 
 -- The main thunk of the server. This code is resposible for reading the request handing it over to the "real thunk"
@@ -220,23 +224,18 @@ responseHandler s error _ _=
 serverThunk :: (Socket, SockAddr) -> WebThunk -> ServerSettings -> IO ()
 serverThunk fullSock@(sock, sockAddr) thunk settings = 
     do 
+        putStrLn "new connection!"
         #ifdef SMUTTDEBUG
         putStrLn $ "Accepted a new socket on:  " ++ (show sock) ++ " " ++ (show sockAddr)
         #endif
         -- Defining a prepared sending procedure. This procedure is sent around to all functions that might need to send data 
-        let 
-            send :: ByteString -> IO Int
-            send outData = B.sendTo sock outData sockAddr
 
-        bSocket    <- BS.makeBufferedSocket fullSock  (readBufferSize settings)
-
+        bSocket    <- BS.makeBufferedSocket fullSock  (readBufferSize settings) (writeBufferSize settings)
         --getTcpNoDelay sock >>= putStrLn . show 
         setTcpNoDelay sock True
 
         setRecvTimeout sock $ fromIntegral (readTimeout settings)
         setSendTimeout sock $ fromIntegral(writeTimeout settings)
-        --setSocketOption sock SendBuffer  (writeBufferSize settings) 
-        --setSocketOption sock RecvBuffer  (readBufferSize settings)
 
         case (socketKeepAlive settings) of 
             True ->  setSocketOption sock KeepAlive 1
@@ -244,23 +243,33 @@ serverThunk fullSock@(sock, sockAddr) thunk settings =
 
         let readLoop = do 
 
+                        let  (inbuf,offsetref,bytesnref,_) = BS.inBuffer bSocket
+                        offset <- readIORef offsetref
+                        bytesn <- readIORef bytesnref
+
                         #ifdef SMUTTDEBUG
                         timeStart    <- getCurrentTime
                         #endif
 
-                        request      <- HTTP.readRequest bSocket send settings `E.catch` (\ e -> if isEOFError e then return HTTP.ClientQuit else E.throw e ) 
-                        keepAlive    <- responseHandler send request thunk settings
+                        request      <- HTTP.readRequest bSocket settings `E.catch` (\ e -> if isEOFError e then return HTTP.ClientQuit else E.throw e ) 
+                        keepAlive    <- responseHandler bSocket request thunk settings
+                        BS.flush bSocket
+
+                        
 
                         #ifdef SMUTTDEBUG
                         timeEnd    <- getCurrentTime
-                        putStrLn show $ diffUTCTime timeStart timeEnd
                         #endif 
 
+                        let
                         if and [ not $ HTTP.connectionClosed request 
                                 , HTTP.protocolCanKeepAlive request
                                 , keepAlive]
-                          then 
-                             readLoop
+                          then do 
+                                continue <- BS.waitForRead bSocket settings
+                                if  continue 
+                                    then readLoop
+                                    else return ()
                           else 
                             return ()
          
@@ -275,7 +284,6 @@ serveWithSettings thunk serverSettings = withSocketsDo $ do
 
     -- create socket
     sock <- socket AF_INET Stream 0
-    putStrLn $ show sock
     -- make socket immediately reusable - eases debugging.
     setSocketOption sock ReuseAddr 1
 

@@ -31,8 +31,8 @@ defaultSettings       =  ServerSettings  {  readBufferSize  = (8 * 1024)  -- 8 K
                                           , writeBufferSize = (8 * 1024)  -- 8 KB
                                           , maxConnections  = 1024
                                           , socketKeepAlive = False
-                                          , readTimeout     = 5000000
-                                          , writeTimeout    = 5000000
+                                          , readTimeout     = 10 * 10 ^ 6
+                                          , writeTimeout    = 5 * 10 ^ 6
                                           , keepServing     = Nothing 
                                           , maxPathLegnth   = 1024
                                           , maxHeaderLength = 1024
