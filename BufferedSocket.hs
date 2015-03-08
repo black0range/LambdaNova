@@ -44,6 +44,10 @@ module BufferedSocket
 , MaxLength
 , inBuffer
 , waitForRead
+, isReadable
+, isWriteable
+, closeRead
+, closeWrite
   )
 where 
 
@@ -105,12 +109,23 @@ type SocketData = (NS.Socket,NS.SockAddr,Fd)
 type OutputBuffer = ((ForeignPtr Word8),BytesInBuffer,BufferSize)
 type InputBuffer  = ((ForeignPtr Word8),ByteOffset,BytesInBuffer,BufferSize)
 
-newtype BufferedSocket   =  BufferedSocket (SocketData, InputBuffer, OutputBuffer)
+newtype BufferedSocket = BufferedSocket (SocketData, InputBuffer, OutputBuffer)
 
 {-
 UTIL 
 -}
 
+isReadable:: BufferedSocket -> IO Bool 
+isReadable (BufferedSocket ((socket,_,_),_,_)) = NS.sIsReadable socket
+
+isWriteable:: BufferedSocket -> IO Bool 
+isWriteable (BufferedSocket ((socket,_,_),_,_)) = NS.isWritable socket
+
+closeRead :: BufferedSocket -> IO ()
+closeRead (BufferedSocket ((socket,_,_),_,_)) = NS.shutdown socket NS.ShutdownReceive
+
+closeWrite :: BufferedSocket -> IO ()
+closeWrite (BufferedSocket ((socket,_,_),_,_)) = NS.shutdown socket NS.ShutdownSend
 -- INPUT BUFFER 
 inBuffer   :: BufferedSocket -> InputBuffer
 inBuffer (BufferedSocket (_,inBuf,_)) = inBuf 

@@ -35,8 +35,6 @@ import System.IO.Error
 
 
 import Network.Socket
-import Network.Socket.Options 
-
 
 import qualified Network.Socket.ByteString as B
 import qualified Data.ByteString           as B  hiding (pack, putStrLn)
@@ -232,13 +230,9 @@ serverThunk fullSock@(sock, sockAddr) thunk settings =
 
         bSocket    <- BS.makeBufferedSocket fullSock  (readBufferSize settings) (writeBufferSize settings)
         --getTcpNoDelay sock >>= putStrLn . show 
-        setTcpNoDelay sock True
-
-        setRecvTimeout sock $ fromIntegral (readTimeout settings)
-        setSendTimeout sock $ fromIntegral(writeTimeout settings)
 
         case (socketKeepAlive settings) of 
-            True ->  setSocketOption sock KeepAlive 1
+            True  ->  setSocketOption sock KeepAlive 1
             False -> return ()
 
         let readLoop = do 
