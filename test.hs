@@ -1,4 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
+
+
 import Prelude 
 import Server
 import qualified HTTP as HTTP 
@@ -20,7 +22,7 @@ testResponseHeaders = [(H.ContentType, "text/html")]
 testfullResponse = "<html><body><h1>Hello world!</h1><body></body>"
 
 
-main = serve testImageServer --testHandler
+main = serve testHandler --testHandler
 --main = serve (\x -> return $ ChukedResponse    200 testResponseHeaders testChunkedBody)
 --main = serve (\x -> return $ FullLazyResponse  200 testResponseHeaders testChunkedBody (Just 46))
 
@@ -57,3 +59,18 @@ testImageServer req = do
         ("strict":_) -> (fileSenderStrict "platypusLg.jpg") 
         ("lazy":_)   -> (fileSender "platypusLg.jpg") 
         _            -> fileNotFoundError
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

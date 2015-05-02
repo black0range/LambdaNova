@@ -24,7 +24,7 @@ import Foreign
 import Network.Socket
 import Data.Word
 import Data.Fixed 
-
+import Foreign.Storable
 import Data.Monoid
 import Data.Bits
 
@@ -63,6 +63,14 @@ nToHexChar x
         nrStart   = 48
         charStart = 65
 
+
+numToWord8ListReal :: (Integral a, Bits a) => a  -> Int -> [Word8]
+numToWord8ListReal _ (-1) = []
+numToWord8ListReal a size = let word = fromIntegral $ shiftR a (size * 8) :: Word8
+                                rest = numToWord8ListReal a (size - 1)
+                            in ( word:rest) 
+numToWord8List:: (Integral a, Bits a, Storable a) => a -> [Word8]
+numToWord8List a =  numToWord8ListReal a ((sizeOf a) - 1)
 
 intToHex :: Word64  -> B.ByteString
 intToHex =  B.pack . reverse . map nToHexChar . intToHexCalc

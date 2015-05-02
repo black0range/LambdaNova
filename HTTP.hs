@@ -10,7 +10,7 @@ module HTTP where
 
 import Cookie
 import Util
-import ServerOptions
+import ServerSettings
 
 import qualified Headers as H
 import qualified URL as URL
@@ -34,6 +34,7 @@ import Data.Either
 import Control.Monad
 
 import qualified BufferedSocket as BS  
+import qualified BufferedSocketHTTPEXT as BS 
 
 type BufferedSocket = BS.BufferedSocket
 type MaxLineLength  = BS.MaxLength
@@ -246,8 +247,9 @@ parseHeaders inData  = [splitted | raw <- inData, let splitted = headerSplitter
 
 
 send100Continue:: BufferedSocket  -> Version -> Maybe (IO ())
-send100Continue bSocket HTTP11 = Just $ void $ BS.send bSocket  "HTTP/1.1 100 Continue\n\r\n\r" 
+send100Continue bSocket HTTP11 = Just $ void $ BS.send bSocket  ("HTTP/1.1 100 Continue\n\r\n\r" ::ByteString) 
 send100Continue _  _ = Nothing
+
 
 
 -- This Reads all the HTTP headers from the socket

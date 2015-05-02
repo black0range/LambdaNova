@@ -20,7 +20,9 @@ Notes for editor: Many functions are splitted into two parts, Any function with 
 {-# LANGUAGE ScopedTypeVariables #-}
 module Server  
 ( serve
-, module ServerOptions
+, module ServerSettings
+, WebThunk
+, serveWithSettings
 ) where  
 
 
@@ -36,9 +38,9 @@ import System.IO.Error
 
 import Network.Socket
 
-import qualified Network.Socket.ByteString as B
 import qualified Data.ByteString           as B  hiding (pack, putStrLn)
 import qualified Data.ByteString.Char8     as B  hiding (findSubstring, elemIndex, split, break, spanEnd, dropWhile)
+
 import qualified Data.ByteString.Internal  as BI
 import qualified Data.ByteString.Builder   as BB
 import qualified Data.ByteString.Lazy      as BL
@@ -56,9 +58,11 @@ import qualified ErrorResponses as ERROR
 import Util
 import qualified HTTP
 import StatusCodes
-import ServerOptions
+import ServerSettings
 import qualified BufferedSocket as BS 
 import qualified Headers as H 
+
+import TCPServer 
 
 type WebThunk = (HTTP.Request -> IO HTTP.Response)
 
@@ -93,7 +97,7 @@ responseHandler bSocket (HTTP.ParsingSuccess request) thunk settings =
     -- Date header for responses 
    
     let 
-        send = BS.send bSocket 
+        send = BS.send bSocket :: (ByteString -> IO ())
         -- A security check to make sure that the response wont be sent as chunked if the HTTP version isn't able to handle it
         -- A warning to the developer should be that if the chunked encoding is sent and the HTTP version isn't correct this might take up a lot of ram
         response = if (HTTP.requestVersion request) < HTTP.HTTP11 
@@ -217,50 +221,28 @@ responseHandler bSocket error _ _=
       BS.send bSocket response
       return False
 
+
+-- The server function, Currently give it a function that will process the request and it will run a new thread from every request
+serveWithSettings :: WebThunk -> ServerSettings-> IO ()
+serveWithSettings thunk serverSettings = makeTCPServer (webServerThunk thunk serverSettings) serverSettings
+
 -- The main thunk of the server. This code is resposible for reading the request handing it over to the "real thunk"
 -- then sending the response in an appropiate manner along with closing down the socket and freeing the pointer
-serverThunk :: (Socket, SockAddr) -> WebThunk -> ServerSettings -> IO ()
-serverThunk fullSock@(sock, sockAddr) thunk settings = 
+webServerThunk :: WebThunk -> ServerSettings -> BS.BufferedSocket -> IO ()
+webServerThunk thunk settings bSocket = 
     do 
         putStrLn "new connection!"
-        #ifdef SMUTTDEBUG
-        putStrLn $ "Accepted a new socket on:  " ++ (show sock) ++ " " ++ (show sockAddr)
-        #endif
-        -- Defining a prepared sending procedure. This procedure is sent around to all functions that might need to send data 
-
-        bSocket    <- BS.makeBufferedSocket fullSock  (readBufferSize settings) (writeBufferSize settings)
-        --getTcpNoDelay sock >>= putStrLn . show 
-
-        case (socketKeepAlive settings) of 
-            True  ->  setSocketOption sock KeepAlive 1
-            False -> return ()
 
         let readLoop = do 
-
-                        let  (inbuf,offsetref,bytesnref,_) = BS.inBuffer bSocket
-                        offset <- readIORef offsetref
-                        bytesn <- readIORef bytesnref
-
-                        #ifdef SMUTTDEBUG
-                        timeStart    <- getCurrentTime
-                        #endif
-
                         request      <- HTTP.readRequest bSocket settings `E.catch` (\ e -> if isEOFError e then return HTTP.ClientQuit else E.throw e ) 
                         keepAlive    <- responseHandler bSocket request thunk settings
                         BS.flush bSocket
-
                         
-
-                        #ifdef SMUTTDEBUG
-                        timeEnd    <- getCurrentTime
-                        #endif 
-
-                        let
                         if and [ not $ HTTP.connectionClosed request 
                                 , HTTP.protocolCanKeepAlive request
                                 , keepAlive]
                           then do 
-                                continue <- BS.waitForRead bSocket settings
+                                continue <- BS.waitForRead bSocket (readTimeout settings)
                                 if  continue 
                                     then readLoop
                                     else return ()
@@ -268,53 +250,11 @@ serverThunk fullSock@(sock, sockAddr) thunk settings =
                             return ()
          
         readLoop
-        sClose sock
-    where 
-        bufferSize = readBufferSize settings
 
--- The server function, Currently give it a function that will process the request and it will run a new thread from every request
-serveWithSettings :: WebThunk -> ServerSettings-> IO ()
-serveWithSettings thunk serverSettings = withSocketsDo $ do 
 
-    -- create socket
-    sock <- socket AF_INET Stream 0
-    -- make socket immediately reusable - eases debugging.
-    setSocketOption sock ReuseAddr 1
 
-    --setSocketOption sock NoDelay 1
-    
-    
-    -- listen on TCP port 8000
-    bindSocket sock (SockAddrInet 8000 iNADDR_ANY)
 
-    -- Tells the socket that it can have max 1000 connections
-    listen sock $ maxConnections serverSettings
-
-    let 
-        maybeKeepServingRef = keepServing serverSettings
-        Just keepServingRef = maybeKeepServingRef
-
-        threadTakeover = do
-                            socketData <- accept sock
-                            newThread <- forkIO (serverThunk socketData thunk serverSettings)
-                            return ()
-
-        keepGoingFun   = do 
-                           serveAnother <- readIORef keepServingRef
-                           if serveAnother 
-                                then 
-                                    threadTakeover >>
-                                        keepGoingFun
-                                else 
-                                    return ()
-
-        choseServingMethod  = case isNothing maybeKeepServingRef of
-                                    True  -> forever threadTakeover
-                                    False -> keepGoingFun
-
-    -- Makes sure that whatever happends ce close the socket. 
-    choseServingMethod `E.onException` (sClose sock)
-
+-- mostly just a test. 
 serve thunk = serveWithSettings thunk defaultSettings
 
 

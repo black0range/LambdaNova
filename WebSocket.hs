@@ -16,6 +16,9 @@ module WebSockets where
 
 import qualified HTTP
 import qualified Headers as H 
+import Util
+import ErrorResponses
+
 import qualified Data.ByteString as B 
 import Data.ByteString.Internal (c2w) 
 import qualified Data.ByteString.Lazy as BL 
@@ -26,14 +29,12 @@ import qualified BufferedSocket as BS
 import qualified Data.Text.Lazy.Encoding as ENC
 import qualified Data.Text.Encoding as STRICTENC
 import qualified Data.Text.Encoding.Error as ENC
+import qualified Network.Socket as NS 
 
 import Data.Maybe 
 import Data.Either 
 import Data.Monid
 import Data.Bits 
-
-import Util
-import ErrorResponses
 
 import Data.List 
 import qualified Data.ByteString.Base64 as B64 
@@ -60,14 +61,15 @@ guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 data Message =    TextMessage    TL.Text 
                 | BinaryMessage  BL.ByteString
-                | ClosedMessage  StatusCode B.ByteString
+                | CloseMessage  StatusCode CloseReasonText
+
 
 data ControllFrame =  Ping  ByteString 
                     | Pong  ByteString
                     | Close StatusCode Text 
 type ControllFrames = [ControllFrame]
 
-type CloseMessage = (StatusCode, CloseMessage)
+type CloseReasonText = TL.ByteString
 
 type Response = Message 
 type Request  = Message 
@@ -75,14 +77,14 @@ type Request  = Message
 type MessageWriter = (Message -> IO ())
 type MessageReader = Message
 
-data WebSocket = WebSocket { bufferedSocket  :: BS.BufferedSocket 
-                            , messageReader  :: (MVar MessageReader) 
-                            , messageWriter  :: (MVar MessageWriter) 
-                            , controllWriter :: (MVar ControllFrames)
-                            , onPing         :: (WebSocket -> PingPongData -> IO ()) 
+data WebSocket = WebSocket { bufferedSocket  :: BS.BufferedSocket       -- reference to the underlying bufferedSocket
+                            , messageReader  :: (MVar Message)          -- When reading a message this will be read. The message is a lazy Text or bytestring. IF 
+                            , messageWriter  :: (MVar MessageWriter)    -- 
+                            , controllFrames :: (IORef ControllFrames)  -- Should be treated with atomic operations 
+                            , onPing         :: (WebSocket -> PingPongData -> IO ())  
                             , onPong         :: (WebSocket -> PingPongData -> IO()) 
                             , onClose        :: (WebSocket -> StatusCode -> CloseText -> IO ())
-                            , closeStatus    :: IORef (Maybe (StatusCode, CloseMessage))
+                            , closeStatus    :: IORef (Maybe (StatusCode, CloseMessage)) -- When a close frame is recieved or sent This will be set
                         }
 
 data AuthenticationError = InvalidVersion | InvalidMethod | MissingHeader H.HeaderName | InvalidHeader H.HeaderName 
@@ -101,7 +103,7 @@ isFin    (FrameHeader fin _ _ _ _ )    = fin
 opCode   (FrameHeader _ code _ _ _ )   = code 
 isMasked (FrameHeader _ _ masked _ _ ) = masked
 getMask  (FrameHeader _ _ _ mask _ )   = mask 
-getPayLoadLength (FrameHeader _ _ _ _ len ) = length  
+getPayLoadLength (FrameHeader _ _ _ _ len ) = len 
 
 {-
    Opcode:  4 bits
@@ -158,7 +160,87 @@ isWriteable :: WebSocket -> IO Bool
 isWriteable WebSocket bSocket _ _ ) = BS.isWriteable bSocket 
 
 
-{-- Reading and writing --}
+{-- Utility --}
+
+-- When a controll frame should be sent this frame is added to the controll que. 
+-- This function adds the specific frame to the end of the que
+-- The frame will be sent in between normal frame sending
+queControllFrame:: WebSocket -> ControllFrame -> IO ()
+queControllFrame webSocket controllFrame = 
+  atomicModifyIORef' controllQue (\currentList -> (currentList ++ [controllFrame],())) 
+  where 
+    controllQue = controllFrames webSocket
+
+handOverRead :: WebSocket -> IO () 
+handOverRead = (>>= putMVar (messageReader webSocket)) . unsafeInterLeaveIO . readMessage   
+
+handOverWrite :: Websocket -> IO ()
+handOverRead = (>>= putMVar (messageWriter webSocket)) . unsafeInterLeaveIO . writeMessage
+{-- Writing --}
+
+
+writeFreamHeader :: WebSocket -> FrameHeader -> IO ()
+writeFreamHeader webSocket (FrameHeader fin opcode masked maskList messageLength) = 
+  let   finBit = if fin then 128 else 0 
+        payloadLength = if messageLength < 126 
+                        then messageLength 
+                        else if messageLength <= 65535 
+                                then 126 
+                                else 127
+        maskBit    = if mask then 128 else 0 
+        extendedPayloadLength = if payloadLength >= 127
+                                then case payloadLength of 
+                                        126 ->  numToWord8List (fromIntegral payloadLength :: Word32)
+                                        127 ->  numToWord8List (fromIntegral payloadLength :: Word64)  --- FIX THIS SHIT 
+                                else []
+
+        firstByte  = fromOpCode opcode .|. if fin then 128 else 0 -- Byte for fin and opcode
+        secondByte = maskBit .|. payloadLength
+        frameList = [firstByte, secondByte] ++ extendedPayloadLength ++ maskList
+    in -- SEND SHIT HERE  
+    where 
+        nSocket = BS.nativeSocket $ bufferedSocket webSocket 
+
+
+
+
+writeBinaryFrame :: WebSocket -> FrameHeader -> BL.ByteString -> IO ()
+writeTextFrame :: WebSocket -> FrameHeader -> TL.Text -> IO ()
+
+writeMessage :: WebSocket -> Message -> IO ()
+writeMessage webSocket (CloseMessage statusCode statusText) = 
+    BS.send bSocket statusCodeData >> 
+        BS.sendText bSocket statusText >> 
+
+        where 
+            bSocket = bufferedSocket webSocket 
+            statusCodeData = statusCodeToByteString statusCode
+
+{-
+
+Table From http://datatracker.ietf.org/doc/rfc6455/?include_text=1 describing the bit table of a frame. 
+This is used to make the functions under 
+ 0                   1                   2                   3
+      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+     +-+-+d-+-+-------+-+-------------+-------------------------------+
+     |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+     |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+     |N|V|V|V|       |S|             |   (if payload len==126/127)   |
+     | |1|2|3|       |K|             |                               |
+     +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+     |     Extended payload length continued, if payload len == 127  |
+     + - - - - - - - - - - - - - - - +-------------------------------+
+     |                               |Masking-key, if MASK set to 1  |
+     +-------------------------------+-------------------------------+
+     | Masking-key (continued)       |          Payload Data         |
+     +-------------------------------- - - - - - - - - - - - - - - - +
+     :                     Payload Data continued ...                :
+     + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+     |                     Payload Data continued ...                |
+     +---------------------------------------------------------------+
+-}
+
+{-- Reading --}
 
 readFrameHeader :: WebSocket -> IO FrameHeader
 readFrameHeader webSocket = 
@@ -194,23 +276,21 @@ readFrameHeader webSocket =
 -- 
 readFrames :: WebSocket -> IO Bl.ByteString
 readFrames webSocket = do
-    readAble <- isReadable webSocket 
-    if readAble 
+    readable <- isReadable webSocket 
+    if readable 
         then do 
             fHead@(FrameHeader fin frameOpCode masked mask payloadLength) <- readFrameHeader bSocket
             if frameOpCode == ConinuationFrame 
                 -- If the frameOP is a continuation frame We will return a lazy bytestring
                 -- if fin is set the "next" step is set to an empry bytestring. And will not continue reading
                 then do  
-                    next      <- nextStep
+                    next      <- unsafeInterLeaveIO $ nextStep
                     inBytes   <- readBody
                     return $ inBytes <> next
 
             -- If the frameOpCode isn't 
             else controllFrameHandler webSocket fHead >> loop
-                    _               -> error "Invalid opCode recieved"
-        else 
-            return ""
+        else handOverRead webSocket >> return ""
 
     where 
         bSocket = bufferedSocket webSocket
@@ -222,14 +302,13 @@ readFrames webSocket = do
         readBody = outData <$> BS.readLazy bSocket payloadLength
 
 
--- The thunk is in case of any special headers 
 readMessage :: WebSocket -> IO Request
-readMessage webSocket thunk = do 
-    readAble <- isReadable webSocket  
-    if readAble 
+readMessage webSocket  = do 
+    readable <- isReadable webSocket  
+    if readable 
         -- if the socket is readable then read as normal
         then do 
-            (FrameHeader fin opCode masked mask payloadLength) <- readFrameHeader webSocket
+            fHead@(FrameHeader fin opCode masked mask payloadLength) <- readFrameHeader webSocket
             if elem opCode [TextFrame, BinaryFrame]
                 then do 
                     firstFrame <- readLazy bSocket payloadLength >>=
@@ -242,19 +321,18 @@ readMessage webSocket thunk = do
                     BinaryFrame -> return $ BinaryMessage inData
                 else
                     if payloadLength <= 125 
-                        then case opCode of 
-                                Ping -> 
-                                Pong -> do 
-                                    inData <- unmaskStrict $ BS.read bSocket
-                        else 
-                            error "Controll frame data to big" 
+                        then controllFrameHandler webSocket fHead >> loop
+                        else error "Controll frame data to big" 
         -- If the socket isn't readable we will get the close status and message from the websockets IORef. 
         -- We will then send the requesting function a "Closed" Frame  
         else do 
             (statusCode, message) <- readIORef (closeStatus webSocket)
+            handOverRead webSocket
             return $ Closed statusCode message
     where 
         bSocket = bufferedSocket webSocket
+        loop    = readMessage webSocket
+
 
 controllFrameHandler :: WebSocket -> FrameHeader -> IO ()
 -- All controll frames MUST have a FIN set
@@ -268,6 +346,13 @@ controllFrameHandler webSocket (FrameHeader fin CloseFrame masked mask payloadLe
 
 controllFrameHandler webSocket (FrameHeader fin opCode masked mask payloadLength) = do 
     inBytes <- read bSocket payloadLength
+    let pingPongData = if masked 
+                        then unmaskStrict mask inBytes
+                        else inBytes
+
+    case opCode of 
+        Ping -> (onPing webSocket) pingPongData fHead 
+        Pong -> (onPong webSocket) pingPongData fHead 
     where 
         bSocket = bufferedSocket webSocket 
 

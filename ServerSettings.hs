@@ -4,8 +4,9 @@ Made by:     Tomas Möre 2015
  
 ------------------------------------------------------------------------------------------}
 {-# LANGUAGE OverloadedStrings #-}
-module ServerOptions where 
+module ServerSettings where 
 import Data.IORef
+import Network.Socket 
 {-
 data ServerData       = ServerData {  currentConnections         :: IORef Integer
                                     , connectionsFromStart       :: IORef Integer
@@ -16,7 +17,7 @@ data ServerData       = ServerData {  currentConnections         :: IORef Intege
 data ServerSettings  = ServerSettings {  readBufferSize    :: Int                                       
                                         , writeBufferSize  :: Int
                                         , maxConnections   :: Int
-
+                                        , serverPort       :: PortNumber 
                                         , socketKeepAlive  :: Bool
                                         , readTimeout      :: Int
                                         , writeTimeout     :: Int
@@ -37,4 +38,5 @@ defaultSettings       =  ServerSettings  {  readBufferSize  = (8 * 1024)  -- 8 K
                                           , maxPathLegnth   = 1024
                                           , maxHeaderLength = 1024
                                           , maxHeaderCount  = 128
+                                          , serverPort      = 8000
                                           }
