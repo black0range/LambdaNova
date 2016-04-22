@@ -1,0 +1,10 @@
+module Smutt.HTTP.Server.Request.Data.Text where
+
+
+
+
+
+
+
+readText :: Request -> IO (Either Error Text)
+
